@@ -303,6 +303,46 @@ def _geo_prologue(K, T, LI):
     """
 
 
+def _geos_prologue(K, T):
+    """xs[t] = geodesic(xin[t], g[t]) from the sums gst[t] = (x.x, x.g, g.g) accumulated by the
+    GEMV that produced g (see _stats_epilogue): no reductions, one barrier."""
+    NT = NSG * 32
+    return f"""
+    {{
+    const float scale = geo[0], gbias = geo[1], lidx = geo[2];
+    for (int t = 0; t < TN; ++t) {{
+        const float xx = max(gst[4 * t], 1e-12f), xg = gst[4 * t + 1], gg = gst[4 * t + 2];
+        const float proj = xg / xx;
+        const float tn = max(sqrt(max(gg - 2.0f * proj * xg + proj * proj * xx, 0.0f)), 1e-8f);
+        const float rr = max(sqrt(xx), 1e-6f);
+        float theta = min(tn / rr, {math.pi / 4}f);
+        theta = min((theta * scale + gbias) / lidx, {math.pi / 4}f);
+        const float c = cos(theta), s = sin(theta) * rr / tn;
+        for (uint i = tid; i < {K}; i += {NT}) {{
+            const float a = xin[t * {K} + i];
+            const float v = a * c + (g[t * {K} + i] - proj * a) * s;
+            xs[t * {K} + i] = v;
+            if (tgid == 0) xout[t * {K} + i] = v;
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    """
+
+
+def _stats_epilogue(T):
+    """Adds this threadgroup's (x.x, x.g, g.g) partial sums of its rows to stats_in (atomic)."""
+    return f"""
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (uint)TN * 3) {{
+        const int t = tid / 3, c = tid % 3;
+        float acc_s = 0;
+        for (int i = 0; i < {NSG}; ++i) acc_s += gs_part[i][t][c];
+        atomic_fetch_add_explicit((device atomic<float>*)stats_in + 4 * t + c, acc_s, memory_order_relaxed);
+    }}
+    """
+
+
 def _norm_prologue(K, T):
     return f"""
     {{
@@ -346,13 +386,24 @@ def _row_bucket(T):
 
 
 def gemv_kernel(
-    K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=4, ndeps=0
+    K,
+    T,
+    segs,
+    prologue,
+    LI=0,
+    Ka=0,
+    sa=0,
+    sb=0,
+    x_in_tg=True,
+    RPS=4,
+    ndeps=0,
+    stats=False,
 ):
     """segs: list of (fmt, gs, rows). Output j is (rows_valid, rows_j) f32. T is the compile-time
     maximum number of rows (see _row_bucket); the actual count TN comes from the input tcnt.
     ndeps extra (unused) inputs order the kernel after the kernels that produced them."""
     # the layer index of a geodesic prologue is read from geo[2] at run time
-    key = ("gemv", K, T, tuple(segs), prologue, Ka, sa, sb, x_in_tg, RPS, ndeps)
+    key = ("gemv", K, T, tuple(segs), prologue, Ka, sa, sb, x_in_tg, RPS, ndeps, stats)
     if key in _kernels:
         return _kernels[key]
     fmts = [s[0] for s in segs]
@@ -363,6 +414,8 @@ def gemv_kernel(
     inputs = []
     if prologue == "geo":
         inputs += ["xin", "g", "geo"]
+    elif prologue == "geos":
+        inputs += ["xin", "g", "geo", "gst"]
     elif prologue == "norm":
         inputs += ["xin"]
     elif prologue == "relu2cat":
@@ -377,8 +430,10 @@ def gemv_kernel(
             inputs += [f"w{j}_s", f"w{j}_b"]
     inputs += [f"dep{j}" for j in range(ndeps)]
     inputs.append("tcnt")
+    if stats:
+        inputs += ["xres", "stats_in"]
     outputs = [f"y{j}" for j in range(len(segs))]
-    if prologue in ("geo", "norm"):
+    if prologue in ("geo", "geos", "norm"):
         outputs.append("xout")
 
     if prologue == "relu2cat":
@@ -409,6 +464,7 @@ def gemv_kernel(
         "norm": lambda: _norm_prologue(K, T).replace(
             f"for (int t = 0; t < {T}; ++t)", "for (int t = 0; t < TN; ++t)"
         ),
+        "geos": lambda: _geos_prologue(K, T),
         "relu2cat": lambda: "",
         "moecat": lambda: (
             f"""
@@ -467,14 +523,21 @@ def gemv_kernel(
         const int row = row0 + r;
         {body}
     }}
+    {"threadgroup float gs_part[" + str(NSG) + "][" + str(T) + "][3];" if stats else ""}
     for (int r = 0; r < {RPS}; ++r) {{
         const int row = row0 + r;
-        if (row >= {total}) break;
+        if (row >= {total}) {{
+            {"if (lane == 0) for (int t = 0; t < " + str(T) + "; ++t) { gs_part[sg][t][0] = 0; gs_part[sg][t][1] = 0; gs_part[sg][t][2] = 0; }" if stats else ""}
+            break;
+        }}
         for (int t = 0; t < TN; ++t) {{
             const float v = simd_sum(acc[r][t]);
-            if (lane == 0) {{ {outs} }}
+            if (lane == 0) {{ {outs}
+                {"const float xr = xres[t * " + str(total) + " + row]; gs_part[sg][t][0] = xr * xr; gs_part[sg][t][1] = xr * v; gs_part[sg][t][2] = v * v;" if stats else ""}
+            }}
         }}
     }}
+    {_stats_epilogue(T) if stats else ""}
     """
     k = mx.fast.metal_kernel(
         name=f"olala_gemv_{abs(hash(key)) % 10**12}",
@@ -532,13 +595,22 @@ def gemv(
     K=None,
     RPS=None,
     deps=(),
+    stats_x=None,
 ):
-    RPS = RPS or 1
     """Run a fused GEMV. x_inputs: list of input arrays for the prologue. ws: list of W.
-    Returns [y_j (T, rows_j) f32 ...] (+ xout (T, K) for geo / norm)."""
+    Returns [y_j (T, rows_j) f32 ...] (+ xout (T, K) for geo / geos / norm).
+
+    stats_x: the residual the next geodesic will rotate; the GEMV then also returns, last,
+    the (T, 4) sums (x.x, x.g, g.g) with g its output (prologue "geos" of the consumer), or
+    None when it cannot (the consumer then uses "geo")."""
+    RPS = RPS or 1
     K = K or ws[0].cols
     segs = [(w.fmt, w.gs or 0, w.rows) for w in ws]
+    if prologue == "geos" and (T > _gemv_limit(ws) or T * K * 4 > TG_X_BYTES):
+        prologue, x_inputs = "geo", x_inputs[:3]
     if T > _gemv_limit(ws):
+        out = _gemv_mlx(x_inputs, ws, prologue, LI, Ka, sa, sb, T, K)
+        return out + [None] if stats_x is not None else out
         return _gemv_mlx(x_inputs, ws, prologue, LI, Ka, sa, sb, T, K)
     if prologue in ("geo", "norm") and T * K * 4 > TG_X_BYTES:
         # too wide for threadgroup memory: run the prologue on its own, then a plain GEMV
@@ -547,21 +619,43 @@ def gemv(
         else:
             x = x_inputs[0]
             xs = x / mx.maximum(mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True)), 1e-12)
-        return gemv([xs], ws, T=T, K=K, RPS=RPS) + [xs]
+        out = gemv([xs], ws, T=T, K=K, RPS=RPS) + [xs]
+        return out + [None] if stats_x is not None else out
     if prologue == "moecat" and T * K * 4 > TG_X_BYTES:
         parts, b = x_inputs
         e = parts.sum(axis=1)  # (T, Ka)
         return gemv(
-            [e, b], ws, prologue="relu2cat", Ka=Ka, sa=Ka, sb=sb, T=T, K=K, RPS=RPS
+            [e, b],
+            ws,
+            prologue="relu2cat",
+            Ka=Ka,
+            sa=Ka,
+            sb=sb,
+            T=T,
+            K=K,
+            RPS=RPS,
+            stats_x=stats_x,
         )
     TC = _row_bucket(T)
-    if prologue in ("geo", "norm", "moecat") and TC * K * 4 > TG_X_BYTES:
+    if prologue in ("geo", "geos", "norm", "moecat") and TC * K * 4 > TG_X_BYTES:
         TC = T  # exact size when the bucket would not fit in threadgroup memory
     # computed inputs are staged in threadgroup memory; plain inputs are read from device
     # memory (faster than staging them, measured)
-    x_in_tg = prologue in ("geo", "norm", "moecat")
+    x_in_tg = prologue in ("geo", "geos", "norm", "moecat")
+    stats = stats_x is not None
     kern, total, _ = gemv_kernel(
-        K, TC, segs, prologue, LI, Ka, sa, sb, x_in_tg, RPS, ndeps=len(deps)
+        K,
+        TC,
+        segs,
+        prologue,
+        LI,
+        Ka,
+        sa,
+        sb,
+        x_in_tg,
+        RPS,
+        ndeps=len(deps),
+        stats=stats,
     )
     ntg = (total + NSG * RPS - 1) // (NSG * RPS)
     inputs = list(x_inputs)
@@ -569,11 +663,23 @@ def gemv(
         inputs += w.arrays()
     inputs += [d.reshape(-1)[:4] for d in deps]
     inputs.append(_tcount(T))
+    if stats:
+        # padded: MLX binds very small inputs as `constant` buffers, which cannot be written
+        gst = zeros_f32((T * 4 + 64,))
+        inputs += [stats_x, gst]
     shapes = [(T, w.rows) for w in ws]
     dtypes = [mx.float32] * len(ws)
-    if prologue in ("geo", "norm"):
+    if prologue in ("geo", "geos", "norm"):
         shapes.append((T, K))
         dtypes.append(mx.float32)
+    if stats:
+        return kern(
+            inputs=inputs,
+            grid=(ntg * NSG * 32, 1, 1),
+            threadgroup=(NSG * 32, 1, 1),
+            output_shapes=shapes,
+            output_dtypes=dtypes,
+        ) + [gst]
     return kern(
         inputs=inputs,
         grid=(ntg * NSG * 32, 1, 1),
@@ -1783,21 +1889,40 @@ def can_decode(model, x, cache, ssm_mask) -> bool:
 
 # fused paths that can be switched off (debugging / comparison)
 _INPLACE_KV = os.environ.get("OLALA_INPLACE_KV", "1") == "1"
+# geodesic sums accumulated (atomically) by the GEMV producing the update, so the next GEMV's
+# prologue needs no reduction; off in deterministic mode (summation order varies)
+_GEO_STATS = (
+    os.environ.get("OLALA_GEO_STATS", "1") == "1"
+    and os.environ.get("OLALA_DETERMINISTIC") != "1"
+)
 
 
-def _moe_block(L, resid, gmix, T, D, deps=()):
-    """geodesic(resid, gmix) -> MoE. Returns (resid', g) with g the MoE output."""
+def _moe_block(L, resid, gmix, T, D, deps=(), gst=None):
+    """geodesic(resid, gmix) -> MoE. Returns (resid', g, gst') with g the MoE output and gst'
+    its geodesic sums for the next layer (None when not available)."""
     li = L["li"]
     moe = L["moe"]
-    logits, hcat, resid = gemv(
-        [resid, gmix, L["geo_mixer"]],
-        [L["router"], L["in_cat"]],
-        prologue="geo",
-        LI=li,
-        T=T,
-        K=D,
-        deps=deps,
-    )
+    if gst is not None:
+        logits, hcat, resid = gemv(
+            [resid, gmix, L["geo_mixer"], gst],
+            [L["router"], L["in_cat"]],
+            prologue="geos",
+            LI=li,
+            T=T,
+            K=D,
+            deps=deps,
+        )
+    else:
+        logits, hcat, resid = gemv(
+            [resid, gmix, L["geo_mixer"]],
+            [L["router"], L["in_cat"]],
+            prologue="geo",
+            LI=li,
+            T=T,
+            K=D,
+            deps=deps,
+        )
+    sx = resid if _GEO_STATS else None
     K_out = moe.d_latent + moe.d_shared
     if T > _gemv_limit([L["up"], L["down"]]):
         # many rows: sorted gather (q)matmul over the selected experts
@@ -1820,7 +1945,7 @@ def _moe_block(L, resid, gmix, T, D, deps=()):
             T=T,
             K=K_out,
         )[0]
-        return resid, g
+        return resid, g, None
     parts = moe_fused(
         logits,
         L["ebias"],
@@ -1833,7 +1958,7 @@ def _moe_block(L, resid, gmix, T, D, deps=()):
         T,
     )
     if _MOE_ATOMIC:  # parts is the summed expert output (T, d_latent)
-        g = gemv(
+        outs = gemv(
             [parts, hcat],
             [L["out_cat"]],
             prologue="relu2cat",
@@ -1842,9 +1967,10 @@ def _moe_block(L, resid, gmix, T, D, deps=()):
             sb=hcat.shape[1],
             T=T,
             K=K_out,
-        )[0]
+            stats_x=sx,
+        )
     else:  # per-threadgroup partials, summed in a fixed order by the GEMV prologue
-        g = gemv(
+        outs = gemv(
             [parts, hcat],
             [L["out_cat"]],
             prologue="moecat",
@@ -1853,20 +1979,33 @@ def _moe_block(L, resid, gmix, T, D, deps=()):
             sb=hcat.shape[1],
             T=T,
             K=K_out,
-        )[0]
-    return resid, g
-
-
-def _m_layer(L, resid, g, prev_geo, prev_li, st, T, D):
-    """One M layer. Returns (resid', g', state')."""
-    H, P, N, R, A, n_static = L["dims"]
-    if g is None:
-        outs = gemv([resid], [L["in"]], prologue="norm", T=T, K=D)
-    else:
-        outs = gemv(
-            [resid, g, prev_geo], [L["in"]], prologue="geo", LI=prev_li, T=T, K=D
         )
+        sx = None
+    return resid, outs[0], (outs[-1] if sx is not None else None)
+
+
+def _in_gemv(segs, resid, g, prev_geo, prev_li, gst, T, D):
+    if g is None:
+        return gemv([resid], segs, prologue="norm", T=T, K=D)
+    if gst is not None:
+        return gemv(
+            [resid, g, prev_geo, gst], segs, prologue="geos", LI=prev_li, T=T, K=D
+        )
+    return gemv([resid, g, prev_geo], segs, prologue="geo", LI=prev_li, T=T, K=D)
+
+
+def _m_layer(L, resid, g, prev_geo, prev_li, st, T, D, gst=None):
+    """One M layer. Returns (resid', g', state', gst')."""
+    H, P, N, R, A, n_static = L["dims"]
+    outs = _in_gemv([L["in"]], resid, g, prev_geo, prev_li, gst, T, D)
     resid = outs[-1]
+    if _GEO_STATS and not (T == 1 and L["mixer_proj"].scales is None):
+        # separate mixer_proj GEMV (as fast as the fused one for quantized weights; the fused
+        # step wins for bf16 at one row) so that it produces the sums
+        y, st = m3_step(outs[0], L["prm"]["m3"], st, H, P, N, R, A, n_static)
+        gmix, gmst = gemv([y], [L["mixer_proj"]], T=T, stats_x=resid)
+        resid, g, gst = _moe_block(L, resid, gmix, T, D, gst=gmst)
+        return resid, g, st, gst
     if T == 1:
         # mixer_proj fused into the step: the threadgroup of each head adds its contribution
         # atomically into gmix; the next GEMV depends on the step's state output for ordering
@@ -1884,21 +2023,18 @@ def _m_layer(L, resid, g, prev_geo, prev_li, st, T, D):
             wmp=L["mixer_proj"],
             gmix=gmix,
         )
-        resid, g = _moe_block(L, resid, gmix, T, D, deps=(st,))
+        resid, g, gst = _moe_block(L, resid, gmix, T, D, deps=(st,))
     else:
         y, st = m3_step(outs[0], L["prm"]["m3"], st, H, P, N, R, A, n_static)
         gmix = gemv([y], [L["mixer_proj"]], T=T)[0]
-        resid, g = _moe_block(L, resid, gmix, T, D)
-    return resid, g, st
+        resid, g, gst = _moe_block(L, resid, gmix, T, D)
+    return resid, g, st, gst
 
 
-def _v_layer(L, resid, g, prev_geo, prev_li, cache, pos, T, D, shared):
+def _v_layer(L, resid, g, prev_geo, prev_li, cache, pos, T, D, shared, gst=None):
     """One V layer. ``shared`` carries per-token values common to all attention layers."""
     segs = [L["in"], L["in_small"]]
-    if g is None:
-        outs = gemv([resid], segs, prologue="norm", T=T, K=D)
-    else:
-        outs = gemv([resid, g, prev_geo], segs, prologue="geo", LI=prev_li, T=T, K=D)
+    outs = _in_gemv(segs, resid, g, prev_geo, prev_li, gst, T, D)
     resid = outs[-1]
     big, small = outs[0], outs[1]
     att = L["attn"]
@@ -1974,9 +2110,12 @@ def _v_layer(L, resid, g, prev_geo, prev_li, cache, pos, T, D, shared):
         small_off=2 * Hk * Rk + 2 * Hk,
         big_off=Hq * Dh + 2 * Rk * Dh,
     )
-    gmix = gemv([ymix], [L["mixer_proj"]], T=T)[0]
-    resid, g = _moe_block(L, resid, gmix, T, D)
-    return resid, g
+    if _GEO_STATS:
+        gmix, gmst = gemv([ymix], [L["mixer_proj"]], T=T, stats_x=resid)
+    else:
+        gmix, gmst = gemv([ymix], [L["mixer_proj"]], T=T)[0], None
+    resid, g, gst = _moe_block(L, resid, gmix, T, D, gst=gmst)
+    return resid, g, gst
 
 
 _warmup_started = set()
@@ -2034,14 +2173,19 @@ def decode(model, x, cache, positions):
     )  # residual stream (T, D) f32 (embedding before the first layer)
     g = None  # pending update for the geodesic of the previous sub-layer
     prev_geo, prev_li = None, 0
+    gst = (
+        None  # geodesic sums of the pending update g (prologue "geos"), when available
+    )
     for L in plan.layers:
         li = L["li"]
         if L["type"] == "M":
             c = cache[li]
-            resid, g, c[0] = _m_layer(L, resid, g, prev_geo, prev_li, c[0], T, D)
+            resid, g, c[0], gst = _m_layer(
+                L, resid, g, prev_geo, prev_li, c[0], T, D, gst
+            )
         else:
-            resid, g = _v_layer(
-                L, resid, g, prev_geo, prev_li, cache[li], pos, T, D, shared
+            resid, g, gst = _v_layer(
+                L, resid, g, prev_geo, prev_li, cache[li], pos, T, D, shared, gst
             )
         prev_geo, prev_li = L["geo_mlp"], li
     return geodesic(resid, g, prev_geo, prev_li, T, D).reshape(B, 1, D)
