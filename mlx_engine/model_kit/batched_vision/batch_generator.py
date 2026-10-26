@@ -100,9 +100,16 @@ def _batch_single_cache(cache: list[Any]) -> list[Any]:
     return batch_cache
 
 
+def _is_scalar_layer_cache(cache: Any) -> bool:
+    # CacheList groups several caches of one layer; it is batch-aware only once its members are.
+    if type(cache).__name__ == "CacheList":
+        return any(_is_scalar_layer_cache(c) for c in cache.caches)
+    return not hasattr(cache, "filter")
+
+
 def _is_scalar_prompt_cache(prompt_cache: list[Any]) -> bool:
     """Return True for ordinary one-request caches, not batch-aware caches."""
-    return any(not hasattr(cache, "filter") for cache in prompt_cache)
+    return any(_is_scalar_layer_cache(cache) for cache in prompt_cache)
 
 
 def _ensure_batch_cache(prompt_cache: list[Any]) -> list[Any]:

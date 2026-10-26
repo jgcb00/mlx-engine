@@ -268,6 +268,7 @@ class Mamba3Mixer(nn.Module):
         Bsz, L, _ = out.shape
         if not hasattr(self, "_prm"):
             self._prm = metal.m3_param_pack(self)
+            mx.eval(self._prm)
         sw = self.P * self.N + self.R * self.N + self.P + self.A
         st = cache[0] if cache is not None and cache[0] is not None else mx.zeros((Bsz, self.H, sw), mx.float32)
         rng = None
@@ -493,6 +494,9 @@ class OlalaModel(nn.Module):
         from . import metal
 
         if self.args.normalize_embeddings_ngpt and metal.can_decode(self, x, cache, ssm_mask):
+            head_fn = getattr(self, "_head_fn", None)
+            if head_fn is not None:
+                metal.maybe_warmup(self, head_fn, B)
             return (metal.decode(self, x, cache, positions),)  # fused path, normalizes itself
         if self.args.normalize_embeddings_ngpt:
             x = x / mx.maximum(mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True)), 1e-12)
@@ -553,6 +557,14 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = OlalaModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+        def head_fn(x):
+            from . import metal
+
+            return metal.head(self.lm_head, x)
+
+        # plain function attribute (not a module): lets the fused path warm up the head kernels
+        self.model._head_fn = head_fn
 
     def __call__(self, inputs: mx.array, cache=None, inputs_embeds=None, **kwargs):
         x = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)

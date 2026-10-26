@@ -15,6 +15,7 @@ sub-layer runs as the prologue of the next matrix-vector product ("geo").
 
 import math
 import os
+import threading
 
 import mlx.core as mx
 from mlx import nn
@@ -339,9 +340,27 @@ def _relu2cat_prologue(K, T, Ka, sa, sb):
     """
 
 
+_tcounts = {}
+
+
+def _tcount(T):
+    a = _tcounts.get(T)
+    if a is None:
+        a = _tcounts[T] = mx.array([T, 0, 0, 0], dtype=mx.int32)
+        mx.eval(a)
+    return a
+
+
+def _row_bucket(T):
+    """GEMV kernels are compiled for a maximum row count and get the actual one at run time,
+    so a new batch size does not trigger a recompilation of every kernel."""
+    return 1 if T == 1 else 2 if T == 2 else 4 if T <= 4 else 8
+
+
 def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=4, ndeps=0):
-    """segs: list of (fmt, gs, rows). Output j is (T, rows_j) f32. ndeps extra (unused) inputs
-    order the kernel after the kernels that produced them."""
+    """segs: list of (fmt, gs, rows). Output j is (rows_valid, rows_j) f32. T is the compile-time
+    maximum number of rows (see _row_bucket); the actual count TN comes from the input tcnt.
+    ndeps extra (unused) inputs order the kernel after the kernels that produced them."""
     key = ("gemv", K, T, tuple(segs), prologue, LI, Ka, sa, sb, x_in_tg, RPS, ndeps)
     if key in _kernels:
         return _kernels[key]
@@ -366,6 +385,7 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
         if fmt.startswith("q"):
             inputs += [f"w{j}_s", f"w{j}_b"]
     inputs += [f"dep{j}" for j in range(ndeps)]
+    inputs.append("tcnt")
     outputs = [f"y{j}" for j in range(len(segs))]
     if prologue in ("geo", "norm"):
         outputs.append("xout")
@@ -375,8 +395,8 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
 
         def xexpr(t, j):
             return (
-                f"((k + 4 * ({j}) < {Ka}) ? *(const device float4*)(a + {t} * {sa} + k + 4 * ({j})) : "
-                f"relu2(*(const device float4*)(b + {t} * {sb} + k + 4 * ({j}))))"
+                f"((k + 4 * ({j}) < {Ka}) ? *(const device float4*)(a + min({t}, TN - 1) * {sa} + k + 4 * ({j})) : "
+                f"relu2(*(const device float4*)(b + min({t}, TN - 1) * {sb} + k + 4 * ({j}))))"
             )
     elif x_in_tg:
         decl = f"threadgroup float xs[{T} * {K}];"
@@ -387,14 +407,14 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
         decl = ""
 
         def xexpr(t, j):
-            return f"*(const device float4*)(x + {t} * {K} + k + 4 * ({j}))"
+            return f"*(const device float4*)(x + min({t}, TN - 1) * {K} + k + 4 * ({j}))"
 
     pro = {
-        "geo": lambda: _geo_prologue(K, T, LI),
-        "norm": lambda: _norm_prologue(K, T),
+        "geo": lambda: _geo_prologue(K, T, LI).replace(f"for (int t = 0; t < {T}; ++t)", "for (int t = 0; t < TN; ++t)"),
+        "norm": lambda: _norm_prologue(K, T).replace(f"for (int t = 0; t < {T}; ++t)", "for (int t = 0; t < TN; ++t)"),
         "relu2cat": lambda: "",
         "moecat": lambda: f"""
-    for (uint i = tid; i < {T} * {K}; i += {NSG} * 32) {{
+    for (uint i = tid; i < TN * {K}; i += {NSG} * 32) {{
         const uint t = i / {K}, k = i % {K};
         float v;
         if (k < {Ka}) {{ v = 0; for (int p = 0; p < {sa}; ++p) v += parts[(t * {sa} + p) * {Ka} + k]; }}
@@ -404,7 +424,7 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
     threadgroup_barrier(mem_flags::mem_threadgroup);
     """,
         "plain": lambda: (
-            f"for (uint i = tid; i < {T} * {K}; i += {NSG} * 32) xs[i] = x[i];\n"
+            f"for (uint i = tid; i < TN * {K}; i += {NSG} * 32) xs[i] = x[i];\n"
             "threadgroup_barrier(mem_flags::mem_threadgroup);"
             if x_in_tg
             else ""
@@ -438,6 +458,7 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
     const uint tid = thread_position_in_threadgroup.x;
     const uint sg = tid / 32, lane = tid % 32;
     const uint tgid = threadgroup_position_in_grid.x;
+    const int TN = tcnt[0];
     {decl}
     {pro}
     const int row0 = (tgid * {NSG} + sg) * {RPS};
@@ -450,7 +471,7 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
     for (int r = 0; r < {RPS}; ++r) {{
         const int row = row0 + r;
         if (row >= {total}) break;
-        for (int t = 0; t < {T}; ++t) {{
+        for (int t = 0; t < TN; ++t) {{
             const float v = simd_sum(acc[r][t]);
             if (lane == 0) {{ {outs} }}
         }}
@@ -570,9 +591,12 @@ def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RP
         parts, b = x_inputs
         e = parts.sum(axis=1)  # (T, Ka)
         return gemv([e, b], ws, prologue="relu2cat", Ka=Ka, sa=Ka, sb=sb, T=T, K=K, RPS=RPS)
+    TC = _row_bucket(T)
+    if prologue in ("geo", "norm", "moecat") and TC * K * 4 > TG_X_BYTES:
+        TC = T  # exact size when the bucket would not fit in threadgroup memory
     x_in_tg = prologue in ("geo", "norm", "moecat") or (
-        prologue == "plain" and T * K * 4 <= TG_X_BYTES and os.environ.get("OLALA_PLAIN_TG", "0") == "1")
-    kern, total, _ = gemv_kernel(K, T, segs, prologue, LI, Ka, sa, sb, x_in_tg, RPS, ndeps=len(deps))
+        prologue == "plain" and TC * K * 4 <= TG_X_BYTES and os.environ.get("OLALA_PLAIN_TG", "0") == "1")
+    kern, total, _ = gemv_kernel(K, TC, segs, prologue, LI, Ka, sa, sb, x_in_tg, RPS, ndeps=len(deps))
     ntg = (total + NSG * RPS - 1) // (NSG * RPS)
     if _TINY and _tiny():
         ntg = 1
@@ -580,6 +604,7 @@ def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RP
     for w in ws:
         inputs += w.arrays()
     inputs += [d.reshape(-1)[:4] for d in deps]
+    inputs.append(_tcount(T))
     shapes = [(T, w.rows) for w in ws]
     dtypes = [mx.float32] * len(ws)
     if prologue in ("geo", "norm"):
@@ -695,7 +720,7 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static, wmp=None, gmix=None):
     PB = M3_PB
     NSG_ = 16
     fused = wmp is not None
-    key = ("m3v2", T, H, P, N, R, A, n_static, PB, wmp.key() if fused else None, wmp.rows if fused else 0)
+    key = ("m3v2", H, P, N, R, A, n_static, PB, wmp.key() if fused else None, wmp.rows if fused else 0)
     if key not in _kernels:
         assert N == 128 and A == 32 and 2 * R <= NSG_ and PB % NSG_ == 0
         src = f"""
@@ -799,7 +824,7 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static, wmp=None, gmix=None):
             )
         else:
             _kernels[key] = mx.fast.metal_kernel(
-                name=f"olala_m3v2_{T}_{PB}",
+                name=f"olala_m3v2_{PB}",
                 input_names=["proj", "prm", "st"],
                 output_names=["y", "st_out"],
                 source=src,
@@ -1176,7 +1201,7 @@ def moe_fused(logits, ebias, x0, x0_stride, wu: W, wd: W, top_k, scaling, T):
     LPRU = max(1, min(32, (NT * (D // chu)) // (FB * max(1, D // chu)) if False else NT // FB))
     while LPRU > 1 and (D // chu) % LPRU:
         LPRU //= 2
-    key = ("moe_fused2", E, F, D, wu.key(), wd.key(), top_k, T, FB, NSG)
+    key = ("moe_fused2", E, F, D, wu.key(), wd.key(), top_k, FB, NSG, x0_stride)
     if key not in _kernels:
         def xu(t, j):
             return f"*(const threadgroup float4*)(xs + k + 4 * ({j}))"
@@ -1332,7 +1357,7 @@ def v_prep(big, small, kprev, vprev, prm, pos, Hq, Hk, Dh, Rk, n_noise, window, 
     With kbuf / vbuf (full cache buffers (B,Hk,cap,Dh)) the new k / v are written in place at
     position wpos[t] instead (see model.KVCache) and k / v are not returned."""
     inplace = kbuf is not None
-    key = ("v_prep", T, Hq, Hk, Dh, Rk, str(kv_dtype), inplace)
+    key = ("v_prep", Hq, Hk, Dh, Rk, str(kv_dtype), inplace)
     if key not in _kernels:
         ot = {mx.bfloat16: "bfloat", mx.float16: "half", mx.float32: "float"}[kv_dtype]
         nbig = Hq * Dh + 2 * Rk * Dh + (Hq - Hk) * Dh
@@ -1622,7 +1647,11 @@ class _Plan:
             L["ebias"] = moe.expert_bias.astype(f32)
             L["moe"] = moe
             self.layers.append(L)
-        mx.eval([[v for v in L["prm"].values()] for L in self.layers])
+        # materialize everything now: lazily created arrays belong to the creating thread's
+        # stream, and decoding may run on another thread (mlx-engine's generation thread)
+        mx.eval([[v for v in L["prm"].values()] + [L["geo_mixer"], L["geo_mlp"], L["ebias"]] for L in self.layers])
+        mx.eval([w.arrays() for L in self.layers for w in (L[k] for k in ("in", "in_small", "mixer_proj", "router",
+                                                                            "in_cat", "out_cat", "up", "down") if k in L)])
 
 
 _plans = {}
@@ -1762,7 +1791,39 @@ _MOE_SPLIT = os.environ.get("OLALA_MOE_SPLIT", "0") == "1"
 _INPLACE_KV = os.environ.get("OLALA_INPLACE_KV", "1") == "1"
 _M3_FUSED_PROJ = os.environ.get("OLALA_M3_FUSED_PROJ", "1") == "1"
 _compiled = {}
-_COMPILE = os.environ.get("OLALA_COMPILE", "1") == "1" and not (_SKIP or _STUB)
+_COMPILE = os.environ.get("OLALA_COMPILE", "0") == "1" and not (_SKIP or _STUB)
+
+
+_warmup_started = set()
+
+
+def _warmup(model, head_fn, rows):
+    """Compile the kernels of other batch sizes ahead of time (background thread)."""
+    from .model import ArraysCache, CacheList, KVCache
+
+    try:
+        with mx.stream(mx.new_stream(mx.gpu)):
+            for T in rows:
+                cache = [
+                    ArraysCache(1) if layer.layer_type == "M" else CacheList(KVCache(), ArraysCache(2))
+                    for layer in model.layers
+                ]
+                tok = mx.zeros((T, 2), dtype=mx.int32)
+                mx.eval(model(tok, cache=cache))
+                out = model(tok[:, :1], cache=cache)
+                if isinstance(out, tuple):
+                    out = head_fn(out[0])
+                mx.eval(out)
+    except Exception:  # warm-up is best effort
+        pass
+
+
+def maybe_warmup(model, head_fn, T):
+    if os.environ.get("OLALA_WARMUP", "1") != "1" or id(model) in _warmup_started:
+        return
+    _warmup_started.add(id(model))
+    rows = [b for b in (1, 2, 4, 8) if b != _row_bucket(T)]
+    threading.Thread(target=_warmup, args=(model, head_fn, rows), daemon=True).start()
 
 
 def decode(model, x, cache, positions):
@@ -1782,7 +1843,7 @@ def decode(model, x, cache, positions):
         li = L["li"]
         first = g is None
         if L["type"] == "M":
-            key = (id(plan), li, T)
+            key = (id(plan), li, T, threading.get_ident())
             fn = _compiled.get(key)
             if fn is None:
                 fn = _m_layer(L, prev_li, T, D, first)
