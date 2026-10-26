@@ -11,7 +11,8 @@ import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
-from mlx_engine.models.olala import metal, model as olala_model, register
+from mlx_engine.models.olala import metal, register
+from mlx_engine.models.olala import model as olala_model
 
 register()
 
@@ -71,9 +72,13 @@ def test_fused_decode_matches_reference(monkeypatch, batch):
     prompt = mx.random.randint(0, TINY["vocab_size"], (batch, 21))
     ref = _decode_logits(m, prompt, 5, fused=False, monkeypatch=monkeypatch)
     monkeypatch.setenv("OLALA_FUSED", "1")
-    assert metal.can_decode(m.model, mx.zeros((batch, 1, 256)), _primed_cache(m, prompt), None)
+    assert metal.can_decode(
+        m.model, mx.zeros((batch, 1, 256)), _primed_cache(m, prompt), None
+    )
     fused = _decode_logits(m, prompt, 5, fused=True, monkeypatch=monkeypatch)
-    assert mx.allclose(ref, fused, atol=2e-3, rtol=2e-3).item(), mx.abs(ref - fused).max().item()
+    assert mx.allclose(ref, fused, atol=2e-3, rtol=2e-3).item(), (
+        mx.abs(ref - fused).max().item()
+    )
 
 
 def _primed_cache(m, prompt):
@@ -88,7 +93,10 @@ def test_chunked_prefill_matches_stepwise(monkeypatch):
     prompt = mx.random.randint(0, TINY["vocab_size"], (1, 45))
     full = m(prompt).astype(mx.float32)
     cache = m.make_cache()
-    parts = [m(prompt[:, s : s + 13], cache=cache).astype(mx.float32) for s in range(0, 45, 13)]
+    parts = [
+        m(prompt[:, s : s + 13], cache=cache).astype(mx.float32)
+        for s in range(0, 45, 13)
+    ]
     assert mx.allclose(full, mx.concatenate(parts, axis=1), atol=1e-4).item()
     cache = m.make_cache()
     steps = [m(prompt[:, i : i + 1], cache=cache).astype(mx.float32) for i in range(45)]
@@ -132,7 +140,10 @@ def test_sanitize_merges_and_is_idempotent():
     hf = {}
     d = 256
     for k, v in flat.items():
-        if k.endswith("mixer.in_proj.weight") and v.shape[0] == m.layers[0].mixer.n_static + m.layers[0].mixer.n_dyn:
+        if (
+            k.endswith("mixer.in_proj.weight")
+            and v.shape[0] == m.layers[0].mixer.n_static + m.layers[0].mixer.n_dyn
+        ):
             n = m.layers[0].mixer.n_static
             hf[k] = v[:n]
             hf[k.replace("in_proj", "in_proj_dyn")] = v[n:]
@@ -147,12 +158,17 @@ def test_sanitize_merges_and_is_idempotent():
     merged = m.sanitize(hf)
     again = m.sanitize(dict(merged))
     assert set(merged) == set(again)
-    for k in flat:
-        if ".mixer.in_proj.weight" in k and flat[k].shape[0] != d:
-            if k in merged and merged[k].shape == flat[k].shape:
-                assert mx.array_equal(merged[k], flat[k]).item()
-    assert mx.array_equal(merged["model.layers.0.mlp.in_cat.weight"], flat["model.layers.0.mlp.in_cat.weight"]).item()
-    assert mx.array_equal(merged["model.layers.0.mlp.out_cat.weight"], flat["model.layers.0.mlp.out_cat.weight"]).item()
+    for k, v in flat.items():
+        if k.endswith("mixer.in_proj.weight") and v.shape[0] != d and k in merged:
+            assert mx.array_equal(merged[k], v).item()
+    assert mx.array_equal(
+        merged["model.layers.0.mlp.in_cat.weight"],
+        flat["model.layers.0.mlp.in_cat.weight"],
+    ).item()
+    assert mx.array_equal(
+        merged["model.layers.0.mlp.out_cat.weight"],
+        flat["model.layers.0.mlp.out_cat.weight"],
+    ).item()
 
 
 def test_registered_for_mlx_lm_and_mlx_vlm():
@@ -167,11 +183,20 @@ def test_registered_for_mlx_lm_and_mlx_vlm():
 @pytest.mark.parametrize("bits", [8, 6, 5, 4])
 def test_fused_decode_quantized(monkeypatch, bits):
     monkeypatch.setattr(olala_model, "_ACT_F32", True)
-    import mlx.nn as nn
+    from mlx import nn
 
     m = _tiny_model()
-    nn.quantize(m, group_size=64, bits=bits, class_predicate=lambda p, mod: m.quant_predicate(p, mod) and hasattr(mod, "to_quantized"))
+    nn.quantize(
+        m,
+        group_size=64,
+        bits=bits,
+        class_predicate=lambda p, mod: (
+            m.quant_predicate(p, mod) and hasattr(mod, "to_quantized")
+        ),
+    )
     prompt = mx.random.randint(0, TINY["vocab_size"], (2, 17))
     ref = _decode_logits(m, prompt, 4, fused=False, monkeypatch=monkeypatch)
     fused = _decode_logits(m, prompt, 4, fused=True, monkeypatch=monkeypatch)
-    assert mx.allclose(ref, fused, atol=5e-3, rtol=5e-3).item(), mx.abs(ref - fused).max().item()
+    assert mx.allclose(ref, fused, atol=5e-3, rtol=5e-3).item(), (
+        mx.abs(ref - fused).max().item()
+    )

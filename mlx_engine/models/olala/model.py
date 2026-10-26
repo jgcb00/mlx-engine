@@ -88,8 +88,15 @@ class ModelArgs(BaseModelArgs):
             raise ValueError(f"Olala: unsupported layer types {sorted(unsupported)}")
         if len(self.layers_config) != self.num_hidden_layers:
             raise ValueError("Olala: layers_config does not match num_hidden_layers")
-        if not (self.token_shift_attn and self.qk_norm and self.gate_attn and self.scalable_softmax):
-            raise ValueError("Olala: only the released attention configuration is supported")
+        if not (
+            self.token_shift_attn
+            and self.qk_norm
+            and self.gate_attn
+            and self.scalable_softmax
+        ):
+            raise ValueError(
+                "Olala: only the released attention configuration is supported"
+            )
 
 
 class InplaceAppendMixin:
@@ -240,7 +247,11 @@ class Mamba3Mixer(nn.Module):
         out = self.in_proj(h)
         from . import metal
 
-        if L > 1 and metal.enabled() and os.environ.get("OLALA_FUSED_PREFILL", "1") == "1":
+        if (
+            L > 1
+            and metal.enabled()
+            and os.environ.get("OLALA_FUSED_PREFILL", "1") == "1"
+        ):
             return self._fused_prefill(out, cache)
         proj, dyn = out[..., : self.n_static], out[..., self.n_static :]
         state = None
@@ -260,27 +271,48 @@ class Mamba3Mixer(nn.Module):
                 cache.advance(L)
         return y
 
-
     def _fused_prefill(self, out, cache):
         """Sequential Metal kernel over the prompt (metal.m3_prefill)."""
-        from . import kernels, metal
+        from . import metal
 
         Bsz, L, _ = out.shape
         if not hasattr(self, "_prm"):
             self._prm = metal.m3_param_pack(self)
             mx.eval(self._prm)
         sw = self.P * self.N + self.R * self.N + self.P + self.A
-        st = cache[0] if cache is not None and cache[0] is not None else mx.zeros((Bsz, self.H, sw), mx.float32)
+        st = (
+            cache[0]
+            if cache is not None and cache[0] is not None
+            else mx.zeros((Bsz, self.H, sw), mx.float32)
+        )
         rng = None
         if cache is not None:
             lp = getattr(cache, "left_padding", None)
             lengths = getattr(cache, "lengths", None)
             if lp is not None or lengths is not None:
-                s0 = mx.zeros((Bsz,), mx.int32) if lp is None else mx.maximum(lp, 0).astype(mx.int32)
-                s1 = mx.full((Bsz,), L, mx.int32) if lengths is None else mx.minimum(lengths, L).astype(mx.int32)
+                s0 = (
+                    mx.zeros((Bsz,), mx.int32)
+                    if lp is None
+                    else mx.maximum(lp, 0).astype(mx.int32)
+                )
+                s1 = (
+                    mx.full((Bsz,), L, mx.int32)
+                    if lengths is None
+                    else mx.minimum(lengths, L).astype(mx.int32)
+                )
                 rng = mx.stack([s0, mx.maximum(s1, s0)], axis=1)
-        y, st = metal.m3_prefill(out.astype(mx.float32), self._prm, st.astype(mx.float32), self.H, self.P, self.N,
-                                 self.R, self.A, self.n_static, rng=rng)
+        y, st = metal.m3_prefill(
+            out.astype(mx.float32),
+            self._prm,
+            st.astype(mx.float32),
+            self.H,
+            self.P,
+            self.N,
+            self.R,
+            self.A,
+            self.n_static,
+            rng=rng,
+        )
         if cache is not None:
             cache[0] = st
             if hasattr(cache, "advance"):
@@ -308,7 +340,9 @@ class DiffTPAttention(nn.Module):
         self.eps = args.norm_epsilon
         self.zc = args.zero_centered_gamma
         self.gate_bias = 1.15 if args.zero_centered_gate else 0.0
-        self.scale = 1.0 / self.head_dim if args.use_completed_p else self.head_dim**-0.5
+        self.scale = (
+            1.0 / self.head_dim if args.use_completed_p else self.head_dim**-0.5
+        )
 
         Hq, Hk, Dh, Rk = self.n_heads, self.n_kv, self.head_dim, self.rank
         # [c_q | W_B_k | W_B_v | gate_proj]
@@ -327,9 +361,13 @@ class DiffTPAttention(nn.Module):
         B, L, _ = h.shape
         Hq, Hk, Dh, Rk = self.n_heads, self.n_kv, self.head_dim, self.rank
         big = self.in_proj(h).astype(mx.float32)
-        small = self.in_proj_small(h.astype(self.in_proj_small.weight.dtype)).astype(mx.float32)
+        small = self.in_proj_small(h.astype(self.in_proj_small.weight.dtype)).astype(
+            mx.float32
+        )
         q, b_k, b_v, gate = mx.split(big, list(_cumsum(self.split_big[:-1])), axis=-1)
-        a_k, a_v, s_k, s_v, lam = mx.split(small, list(_cumsum(self.split_small[:-1])), axis=-1)
+        a_k, a_v, s_k, s_v, lam = mx.split(
+            small, list(_cumsum(self.split_small[:-1])), axis=-1
+        )
         q = q.reshape(B, L, Hq, Dh)
         k = (a_k.reshape(B, L, Hk, Rk) @ b_k.reshape(B, L, Rk, Dh)) / Rk
         v = (a_v.reshape(B, L, Hk, Rk) @ b_v.reshape(B, L, Rk, Dh)) / Rk
@@ -351,7 +389,10 @@ class DiffTPAttention(nn.Module):
 
         # token shift: mix with the previous token's raw k / v
         if shift_cache is not None and shift_cache[0] is not None:
-            k_last, v_last = shift_cache[0].astype(mx.float32), shift_cache[1].astype(mx.float32)
+            k_last, v_last = (
+                shift_cache[0].astype(mx.float32),
+                shift_cache[1].astype(mx.float32),
+            )
         else:
             k_last = mx.zeros((B, 1, Hk, Dh), dtype=mx.float32)
             v_last = mx.zeros((B, 1, Hk, Dh), dtype=mx.float32)
@@ -362,8 +403,12 @@ class DiffTPAttention(nn.Module):
             if lengths is not None and L > 1:
                 idx = mx.clip(lengths - 1, 0, L - 1).reshape(B, 1, 1, 1)
                 keep = (lengths > 0).reshape(B, 1, 1, 1)
-                shift_cache[0] = mx.where(keep, mx.take_along_axis(k, idx, axis=1), k_last)
-                shift_cache[1] = mx.where(keep, mx.take_along_axis(v, idx, axis=1), v_last)
+                shift_cache[0] = mx.where(
+                    keep, mx.take_along_axis(k, idx, axis=1), k_last
+                )
+                shift_cache[1] = mx.where(
+                    keep, mx.take_along_axis(v, idx, axis=1), v_last
+                )
             else:
                 shift_cache[0] = k[:, -1:]
                 shift_cache[1] = v[:, -1:]
@@ -375,10 +420,16 @@ class DiffTPAttention(nn.Module):
         k = alpha_k * k_prev + (1 - alpha_k) * k
         v = alpha_v * v_prev + (1 - alpha_v) * v
 
-        q = mx.fast.rms_norm(q, _zc(self.q_norm.norm.weight, self.zc).astype(mx.float32), self.eps)
-        k = mx.fast.rms_norm(k, _zc(self.k_norm.norm.weight, self.zc).astype(mx.float32), self.eps)
+        q = mx.fast.rms_norm(
+            q, _zc(self.q_norm.norm.weight, self.zc).astype(mx.float32), self.eps
+        )
+        k = mx.fast.rms_norm(
+            k, _zc(self.k_norm.norm.weight, self.zc).astype(mx.float32), self.eps
+        )
         # scalable softmax: q *= s_h * log(min(pos + 1, window))
-        log_pos = mx.log(mx.minimum(positions.astype(mx.float32) + 1.0, float(self.window)))
+        log_pos = mx.log(
+            mx.minimum(positions.astype(mx.float32) + 1.0, float(self.window))
+        )
         q = q * (self.softmax_scaler.astype(mx.float32) * log_pos[..., None])[..., None]
 
         dtype = h.dtype
@@ -387,9 +438,13 @@ class DiffTPAttention(nn.Module):
         v = v.astype(dtype).transpose(0, 2, 1, 3)
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
-        o = kernels.softcap_attention(q, k, v, self.scale, self.softcap, mask)  # (B,Hq,L,Dh)
+        o = kernels.softcap_attention(
+            q, k, v, self.scale, self.softcap, mask
+        )  # (B,Hq,L,Dh)
         o = o.transpose(0, 2, 1, 3).reshape(B, L, self.n_noise, self.snr + 1, Dh)
-        o = o[..., : self.snr, :].astype(mx.float32) - lam * o[..., self.snr :, :].astype(mx.float32)
+        o = o[..., : self.snr, :].astype(mx.float32) - lam * o[
+            ..., self.snr :, :
+        ].astype(mx.float32)
         o = o.reshape(B, L, self.n_sig, Dh) * nn.silu(gate + self.gate_bias)
         return o.reshape(B, L, -1)
 
@@ -422,11 +477,15 @@ class OlalaMoE(nn.Module):
         self.expert_bias = mx.zeros((self.n_experts,))
         self.in_cat = nn.Linear(d, self.d_latent + self.d_shared, bias=False)
         self.out_cat = nn.Linear(self.d_latent + self.d_shared, d, bias=False)
-        self.experts = _Experts(self.d_latent, args.moe_routed_intermediate_size, self.n_experts)
+        self.experts = _Experts(
+            self.d_latent, args.moe_routed_intermediate_size, self.n_experts
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         logits = self.moe_gate(x.astype(self.moe_gate.weight.dtype)).astype(mx.float32)
-        inds, probs = kernels.moe_route(logits, self.expert_bias, self.top_k, self.scaling)
+        inds, probs = kernels.moe_route(
+            logits, self.expert_bias, self.top_k, self.scaling
+        )
         h = self.in_cat(x)
         x0, sh = h[..., : self.d_latent], h[..., self.d_latent :]
         e = kernels.moe_experts(x0, inds, probs.astype(x0.dtype), self.experts)
@@ -449,16 +508,22 @@ class OlalaBlock(nn.Module):
         self.geodesic_mlp = _Geodesic()
         self.mlp = OlalaMoE(args)
 
-    def __call__(self, x, dtype, cache=None, shift_cache=None, mask=None, positions=None):
+    def __call__(
+        self, x, dtype, cache=None, shift_cache=None, mask=None, positions=None
+    ):
         h = x.astype(dtype)
         if self.layer_type == "M":
             y = self.mixer(h, cache, mask)
         else:
             y = self.mixer(h, cache, shift_cache, mask, positions)
         y = self.mixer_proj(y.astype(dtype))
-        x = geodesic_update(x, y, self.geodesic_mixer.scale, self.geodesic_mixer.bias, self.layer_idx)
+        x = geodesic_update(
+            x, y, self.geodesic_mixer.scale, self.geodesic_mixer.bias, self.layer_idx
+        )
         y = self.mlp(x.astype(dtype))
-        return geodesic_update(x, y, self.geodesic_mlp.scale, self.geodesic_mlp.bias, self.layer_idx)
+        return geodesic_update(
+            x, y, self.geodesic_mlp.scale, self.geodesic_mlp.bias, self.layer_idx
+        )
 
 
 class OlalaModel(nn.Module):
@@ -486,18 +551,27 @@ class OlalaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        kv0 = cache[self.attn_idx[0]][0] if self.attn_idx and cache[self.attn_idx[0]] is not None else None
+        kv0 = (
+            cache[self.attn_idx[0]][0]
+            if self.attn_idx and cache[self.attn_idx[0]] is not None
+            else None
+        )
         positions = _positions(kv0, B, L)
         c_ssm = cache[self.ssm_idx[0]] if self.ssm_idx else None
-        ssm_mask = c_ssm.make_mask(L) if c_ssm is not None and hasattr(c_ssm, "make_mask") else None
+        ssm_mask = (
+            c_ssm.make_mask(L)
+            if c_ssm is not None and hasattr(c_ssm, "make_mask")
+            else None
+        )
 
         from . import metal
 
-        if self.args.normalize_embeddings_ngpt and metal.can_decode(self, x, cache, ssm_mask):
-            head_fn = getattr(self, "_head_fn", None)
-            if head_fn is not None:
-                metal.maybe_warmup(self, head_fn, B)
-            return (metal.decode(self, x, cache, positions),)  # fused path, normalizes itself
+        if self.args.normalize_embeddings_ngpt and metal.can_decode(
+            self, x, cache, ssm_mask
+        ):
+            return (
+                metal.decode(self, x, cache, positions),
+            )  # fused path, normalizes itself
         if self.args.normalize_embeddings_ngpt:
             x = x / mx.maximum(mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True)), 1e-12)
 
@@ -580,7 +654,9 @@ class Model(nn.Module):
 
     def make_cache(self) -> list[Any]:
         return [
-            ArraysCache(1) if layer.layer_type == "M" else CacheList(KVCache(), ArraysCache(2))
+            ArraysCache(1)
+            if layer.layer_type == "M"
+            else CacheList(KVCache(), ArraysCache(2))
             for layer in self.model.layers
         ]
 
@@ -596,23 +672,39 @@ class Model(nn.Module):
             for suffix in ("weight", "scales", "biases"):
                 parts = [f"{s}.{suffix}" for s in srcs]
                 if all(p in w for p in parts):
-                    w[f"{dst}.{suffix}"] = mx.concatenate([w.pop(p) for p in parts], axis=axis)
+                    w[f"{dst}.{suffix}"] = mx.concatenate(
+                        [w.pop(p) for p in parts], axis=axis
+                    )
 
         for i, t in enumerate(self.args.layers_config):
             p = f"model.layers.{i}"
             if t == "M" and f"{p}.mixer.in_proj_dyn.weight" in w:
-                cat(f"{p}.mixer.in_proj", [f"{p}.mixer.in_proj", f"{p}.mixer.in_proj_dyn"])
+                cat(
+                    f"{p}.mixer.in_proj",
+                    [f"{p}.mixer.in_proj", f"{p}.mixer.in_proj_dyn"],
+                )
             if t == "V" and f"{p}.mixer.c_q.weight" in w:
                 m = f"{p}.mixer"
-                cat(f"{m}.in_proj", [f"{m}.c_q", f"{m}.W_B_k", f"{m}.W_B_v", f"{p}.gate_proj"])
+                cat(
+                    f"{m}.in_proj",
+                    [f"{m}.c_q", f"{m}.W_B_k", f"{m}.W_B_v", f"{p}.gate_proj"],
+                )
                 cat(
                     f"{m}.in_proj_small",
-                    [f"{m}.W_A_k", f"{m}.W_A_v", f"{m}.shift_proj_k", f"{m}.shift_proj_v", f"{m}.lambda_proj"],
+                    [
+                        f"{m}.W_A_k",
+                        f"{m}.W_A_v",
+                        f"{m}.shift_proj_k",
+                        f"{m}.shift_proj_v",
+                        f"{m}.lambda_proj",
+                    ],
                 )
             if f"{p}.mlp.down_proj.weight" in w:
                 m = f"{p}.mlp"
                 cat(f"{m}.in_cat", [f"{m}.down_proj", f"{m}.shared_experts.fc_1"])
-                cat(f"{m}.out_cat", [f"{m}.up_proj", f"{m}.shared_experts.fc_2"], axis=1)
+                cat(
+                    f"{m}.out_cat", [f"{m}.up_proj", f"{m}.shared_experts.fc_2"], axis=1
+                )
         if self.args.tie_word_embeddings:
             w.pop("lm_head.weight", None)
         return w
@@ -624,8 +716,15 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         big = (
-            "in_proj.weight", "in_proj_small.weight", "mixer_proj.weight", "in_cat.weight", "out_cat.weight",
-            "experts.weight", "output_experts.weight", "embedding.weight", "lm_head.weight",
+            "in_proj.weight",
+            "in_proj_small.weight",
+            "mixer_proj.weight",
+            "in_cat.weight",
+            "out_cat.weight",
+            "experts.weight",
+            "output_experts.weight",
+            "embedding.weight",
+            "lm_head.weight",
         )
 
         def predicate(path: str):

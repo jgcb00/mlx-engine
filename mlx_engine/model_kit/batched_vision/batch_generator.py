@@ -6,28 +6,12 @@ The batcher only owns language-model prefill/decode plus RoPE delta handoff.
 
 import contextlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
-from mlx_engine.model_kit.batched_vision.prompt_cache.chunks import (
-    extend_prefix_cache_chunks,
-)
-from mlx_engine.model_kit.batched_vision.prompt_cache.types import (
-    DEFAULT_PREFIX_CHUNK_SIZE,
-    PromptImageSpan,
-    PromptPrefixChunk,
-)
-from mlx_engine.model_kit.batched_vision.prefill_plan import PrefillPlan
-from mlx_engine.model_kit.batched_vision.prompt_inputs import (
-    drop_prompt_kwargs_prefix,
-    slice_prompt_kwargs,
-)
-from mlx_engine.model_kit.patches.gemma4 import (
-    image_prefill_runs as gemma4_image_prefill_runs,
-    prepare_cached_suffix_prompt_kwargs as prepare_gemma4_cached_suffix_prompt_kwargs,
-)
+from mlx import nn
 from mlx_vlm.generate import (
     DEFAULT_COMPLETION_BATCH_SIZE,
     DEFAULT_MAX_TOKENS,
@@ -36,6 +20,26 @@ from mlx_vlm.generate import (
     wired_limit,
 )
 from mlx_vlm.models.cache import make_prompt_cache
+
+from mlx_engine.model_kit.batched_vision.prefill_plan import PrefillPlan
+from mlx_engine.model_kit.batched_vision.prompt_cache.chunks import (
+    extend_prefix_cache_chunks,
+)
+from mlx_engine.model_kit.batched_vision.prompt_cache.types import (
+    DEFAULT_PREFIX_CHUNK_SIZE,
+    PromptImageSpan,
+    PromptPrefixChunk,
+)
+from mlx_engine.model_kit.batched_vision.prompt_inputs import (
+    drop_prompt_kwargs_prefix,
+    slice_prompt_kwargs,
+)
+from mlx_engine.model_kit.patches.gemma4 import (
+    image_prefill_runs as gemma4_image_prefill_runs,
+)
+from mlx_engine.model_kit.patches.gemma4 import (
+    prepare_cached_suffix_prompt_kwargs as prepare_gemma4_cached_suffix_prompt_kwargs,
+)
 from mlx_engine.processors.repetition_penalty_processor import (
     RepetitionPenaltyProcessor,
 )
@@ -81,7 +85,7 @@ class _PendingSequence:
     logits_processors: list[LogitsProcessor]
     inputs_embeds: mx.array
     prefill_plan: PrefillPlan | None
-    cache: Optional[list[Any]]
+    cache: list[Any] | None
     all_tokens: list[int]
     rope_deltas: Any | None
     prompt_kwargs: dict
@@ -360,10 +364,10 @@ class GenerationBatch:
         uid: int
         token: int
         token_logprob: float
-        finish_reason: Optional[str]
-        top_logprobs: Optional[list[tuple[int, float]]] = None
-        prompt_cache: Optional[list[Any]] = None
-        all_tokens: Optional[list[int]] = None
+        finish_reason: str | None
+        top_logprobs: list[tuple[int, float]] | None = None
+        prompt_cache: list[Any] | None = None
+        all_tokens: list[int] | None = None
         rope_deltas: Any | None = None
 
     def __init__(
@@ -379,7 +383,7 @@ class GenerationBatch:
         prefix_cache_save_states: list[_PrefixCacheSaveState],
         top_logprobs_k: int = 0,
         top_logprobs: list[int] | None = None,
-        all_tokens: Optional[list[list[int]]] = None,
+        all_tokens: list[list[int]] | None = None,
         rope_deltas: Any | None = None,
     ):
         self.model = model
@@ -775,9 +779,9 @@ class _PromptPrefill:
         prompt_kwargs: dict,
         prefix_cache_save_state: _PrefixCacheSaveState,
         prefill_plan: PrefillPlan | None = None,
-        prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
-        cache: Optional[list[Any]] = None,
-        all_tokens: Optional[list[int]] = None,
+        prefill_step_size: int | None = DEFAULT_PREFILL_STEP_SIZE,
+        cache: list[Any] | None = None,
+        all_tokens: list[int] | None = None,
         rope_deltas: Any | None = None,
     ):
         self.model = model
@@ -1126,7 +1130,7 @@ class BatchGenerator:
         stop_criteria,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
-        prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+        prefill_step_size: int | None = DEFAULT_PREFILL_STEP_SIZE,
         top_logprobs_k: int = 0,
     ):
         self.model = model
@@ -1137,7 +1141,7 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.completion_batch_size = completion_batch_size
 
-        self._prompt_batch: Optional[_PromptPrefill] = None
+        self._prompt_batch: _PromptPrefill | None = None
         self._unprocessed_sequences: list[_PendingSequence] = []
 
         self._steps_counter = 0
@@ -1170,11 +1174,11 @@ class BatchGenerator:
         image_spans: list[PromptImageSpan],
         max_tokens: int | None = None,
         top_logprobs: int | None = None,
-        cache: Optional[list[Any]] = None,
+        cache: list[Any] | None = None,
         all_tokens: list[int],
         rope_deltas: Any | None = None,
         next_prefix_cache_chunk_idx: int,
-        prompt_cache_save_callback: Optional[PromptCacheSaveCallback] = None,
+        prompt_cache_save_callback: PromptCacheSaveCallback | None = None,
     ) -> int:
         uid = self.uid_count
         self.uid_count += 1

@@ -8,7 +8,6 @@ classes (BatchedVisionModelKit), so the model is also exposed as
 
 from dataclasses import dataclass
 
-import mlx.core as mx
 from mlx import nn
 from mlx_vlm.models import cache as vlm_cache
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
@@ -30,7 +29,14 @@ class CacheList(olala.AttnCacheMixin, vlm_cache.CacheList):
 
 
 class LanguageModel(olala.Model):
-    def __call__(self, inputs=None, cache=None, inputs_embeds=None, logits_to_keep=None, **kwargs):
+    def __call__(
+        self, inputs=None, cache=None, inputs_embeds=None, logits_to_keep=None, **kwargs
+    ):
+        from . import metal
+
+        # continuous batching sees several batch sizes: compile their decode kernels in the
+        # background from the first call on (mlx-engine probes the model at load time)
+        metal.maybe_warmup(self.model, self.model._head_fn)
         x = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
         if isinstance(x, tuple):
             from . import metal
@@ -38,11 +44,15 @@ class LanguageModel(olala.Model):
             return LanguageModelOutput(logits=metal.head(self.lm_head, x[0]))
         if isinstance(logits_to_keep, int) and logits_to_keep > 0:
             x = x[:, -logits_to_keep:]
-        return LanguageModelOutput(logits=self.lm_head(x.astype(self.model.compute_dtype())))
+        return LanguageModelOutput(
+            logits=self.lm_head(x.astype(self.model.compute_dtype()))
+        )
 
     def make_cache(self):
         return [
-            vlm_cache.ArraysCache(1) if layer.layer_type == "M" else CacheList(KVCache(), vlm_cache.ArraysCache(2))
+            vlm_cache.ArraysCache(1)
+            if layer.layer_type == "M"
+            else CacheList(KVCache(), vlm_cache.ArraysCache(2))
             for layer in self.model.layers
         ]
 
@@ -54,8 +64,12 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.language_model = LanguageModel(config)
 
-    def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs) -> InputEmbeddingsFeatures:
-        return InputEmbeddingsFeatures(inputs_embeds=self.language_model.model.embedding(input_ids))
+    def get_input_embeddings(
+        self, input_ids=None, pixel_values=None, **kwargs
+    ) -> InputEmbeddingsFeatures:
+        return InputEmbeddingsFeatures(
+            inputs_embeds=self.language_model.model.embedding(input_ids)
+        )
 
     def __call__(self, input_ids, pixel_values=None, mask=None, cache=None, **kwargs):
         if kwargs.get("inputs_embeds") is None:
@@ -64,10 +78,17 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         if any(k.startswith("language_model.") for k in weights):
-            inner = {k[len("language_model."):]: v for k, v in weights.items() if k.startswith("language_model.")}
+            inner = {
+                k[len("language_model.") :]: v
+                for k, v in weights.items()
+                if k.startswith("language_model.")
+            }
         else:
             inner = weights
-        return {f"language_model.{k}": v for k, v in self.language_model.sanitize(inner).items()}
+        return {
+            f"language_model.{k}": v
+            for k, v in self.language_model.sanitize(inner).items()
+        }
 
     @property
     def layers(self):

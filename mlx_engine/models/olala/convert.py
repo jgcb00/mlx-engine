@@ -45,7 +45,9 @@ def _clean(mlx_path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--hf-path", required=True)
     parser.add_argument("--mlx-path", required=True)
     parser.add_argument("--recipe", choices=["bf16", *RECIPES], default="bf16")

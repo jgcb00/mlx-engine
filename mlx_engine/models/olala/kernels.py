@@ -23,7 +23,7 @@ def _m3_prep(proj, dyn, m, mask):
     """Split the projections and discretize. Returns f32 tensors:
     x, z (B,L,H,P); dt, la (log alpha), trap (B,L,H); Bn, Cn (B,L,R,N); ang_inc (B,L,H,A)."""
     Bsz, L, _ = proj.shape
-    H, R, N, P, A = m.H, m.R, m.N, m.P, m.A
+    H, R, N, P, _A = m.H, m.R, m.N, m.P, m.A
     ph = proj.reshape(Bsz, L, H, 2 * P + 3).astype(mx.float32)
     z = ph[..., :P]
     x = ph[..., P : 2 * P]
@@ -57,7 +57,7 @@ def _m3_prep(proj, dyn, m, mask):
 def m3_unpack(st, m):
     """Packed state (B, H, P*N + R*N + P + A) -> (angle, S, k, x)."""
     B = st.shape[0]
-    H, R, N, P, A = m.H, m.R, m.N, m.P, m.A
+    H, R, N, P, _A = m.H, m.R, m.N, m.P, m.A
     o1, o2, o3 = P * N, P * N + R * N, P * N + R * N + P
     return (
         st[..., o3:],
@@ -71,7 +71,12 @@ def m3_pack(state, m):
     ang, S, k, x = state
     B, H = S.shape[:2]
     return mx.concatenate(
-        [S.reshape(B, H, -1), k.reshape(B, H, -1).astype(mx.float32), x.astype(mx.float32), ang.astype(mx.float32)],
+        [
+            S.reshape(B, H, -1),
+            k.reshape(B, H, -1).astype(mx.float32),
+            x.astype(mx.float32),
+            ang.astype(mx.float32),
+        ],
         axis=-1,
     )
 
@@ -113,7 +118,7 @@ def mamba3_forward(proj, dyn, state, m, mask=None, lengths=None):
 
 def _mamba3_step_ref(proj, dyn, state, m):
     Bsz = proj.shape[0]
-    H, R, N, P, A = m.H, m.R, m.N, m.P, m.A
+    H, _R, _N, P, A = m.H, m.R, m.N, m.P, m.A
     ang0, S, k_prev, x_prev = state
     x, z, dt, la, trap, Bn, Cn, ang_inc = _m3_prep(proj, dyn, m, None)
     x, z, dt, la, trap = (
@@ -270,7 +275,7 @@ ATTN_SCORE_BUDGET = 512 * 1024 * 1024  # bytes of f32 scores materialized at onc
 def softcap_attention(q, k, v, scale, softcap, mask):
     """q: (B,Hq,L,D), k/v: (B,Hk,T,D). mask: None, "causal" or bool array broadcastable to (B,1,L,T).
     Queries are processed in chunks so that the f32 score matrix stays under ATTN_SCORE_BUDGET."""
-    B, Hq, L, D = q.shape
+    B, Hq, L, _D = q.shape
     T = k.shape[2]
     qc = max(1, ATTN_SCORE_BUDGET // (4 * B * Hq * T))
     if qc >= L:
@@ -281,7 +286,9 @@ def softcap_attention(q, k, v, scale, softcap, mask):
         m = mask
         if m is not None and not isinstance(m, str):
             m = m[..., s0:s1, :] if m.shape[-2] == L else m
-        outs.append(_softcap_attention_chunk(q[:, :, s0:s1], k, v, scale, softcap, m, s0, L))
+        outs.append(
+            _softcap_attention_chunk(q[:, :, s0:s1], k, v, scale, softcap, m, s0, L)
+        )
         mx.eval(outs[-1])
     return mx.concatenate(outs, axis=2)
 
