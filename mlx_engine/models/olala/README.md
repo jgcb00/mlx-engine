@@ -34,10 +34,9 @@ checkpoint does not need the HF remote code.
 
 | format | bytes / token | decode B=1 | share of 819 GB/s | B=4 total | B=64 total | prefill (8k, 2048 chunks) |
 |---|---|---|---|---|---|---|
-| bf16 | 2.58 GB | 181 tok/s | 57 % | 503 tok/s | 1864 tok/s | 2149 tok/s |
-| q8 | 1.45 GB | 241 tok/s | 43 % | 472 tok/s | 1777 tok/s | 2167 tok/s |
-| q6 | 1.14 GB | 259 tok/s | 36 % | 495 tok/s | 1748 tok/s | 2157 tok/s |
-| q4e8 | 1.39 GB | 245 tok/s | 42 % | 481 tok/s | 1715 tok/s | 2167 tok/s |
+| bf16 | 2.58 GB | 183 tok/s | 58 % | 494 tok/s | 1816 tok/s | 2838 tok/s |
+| q8 | 1.45 GB | 246 tok/s | 43 % | 505 tok/s | 1766 tok/s | 2857 tok/s |
+| q6 | 1.14 GB | 271 tok/s | 38 % | 530 tok/s | 1739 tok/s | 2845 tok/s |
 
 For reference, llama.cpp (same machine, Metal) decodes one stream at 149 tok/s
 (bf16) and 178 tok/s (q8_0-safe2). Bytes / token counts every weight read for
@@ -61,8 +60,9 @@ path (`kernels.py`, kept for prefill fallback and testing):
 
 Activations stay in f32; weights are read as bf16 / f16 / f32 or MLX affine
 4 / 5 / 6 / 8-bit. Above 8 rows (bf16) / 5 rows (quantized) the matrix products
-use MLX's (q)matmul. Prefill uses MLX matmuls plus a fused sequential Mamba-3
-kernel (`m3_prefill`).
+use MLX's (q)matmul. Prefill uses MLX matmuls, a fused sequential Mamba-3 kernel
+(`m3_prefill`), a flash-attention style kernel with soft-capping
+(`attn_prefill`) and the fused geodesic kernel.
 
 Things measured along the way that shape the code:
 
@@ -73,8 +73,11 @@ Things measured along the way that shape the code:
   previous command buffer is in flight; `InplaceAppendMixin` appends in place when
   no one else can see the positions written (copy-on-write otherwise).
 - Kernels are compiled per row bucket (1 / 2 / 4 / 8); the mlx-vlm wrapper
-  compiles them in the background at load, so a new batch size in a server does
-  not stall on Metal compilation.
+  compiles them all on its first call (~1.6 s at load), so a new batch size in a
+  server does not stall on Metal compilation (compiling from a background thread
+  while another thread evaluates crashed MLX).
+- The GEMV producing a residual update also accumulates the geodesic sums
+  (x.x, x.g, g.g), so the next GEMV's prologue needs no reduction.
 - Routed-expert outputs are summed with float atomics (fastest). The summation
   order then varies between runs; `OLALA_DETERMINISTIC=1` uses fixed-order partial
   sums instead (~3 % slower).

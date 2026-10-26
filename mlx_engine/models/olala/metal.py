@@ -15,7 +15,6 @@ sub-layer runs as the prologue of the next matrix-vector product ("geo").
 
 import math
 import os
-import threading
 
 import mlx.core as mx
 from mlx import nn
@@ -2122,32 +2121,32 @@ _warmup_started = set()
 
 
 def _warmup(model, head_fn, rows):
-    """Compile the kernels of other batch sizes ahead of time (background thread)."""
+    """Compile the decode kernels of the given batch sizes (throwaway caches)."""
     from .model import ArraysCache, CacheList, KVCache
 
-    try:
-        with mx.stream(mx.new_stream(mx.gpu)):
-            for T in rows:
-                cache = [
-                    ArraysCache(1)
-                    if layer.layer_type == "M"
-                    else CacheList(KVCache(), ArraysCache(2))
-                    for layer in model.layers
-                ]
-                tok = mx.zeros((T, 2), dtype=mx.int32)
-                mx.eval(model(tok, cache=cache))
-                out = model(tok[:, :1], cache=cache)
-                if isinstance(out, tuple):
-                    out = head_fn(out[0])
-                mx.eval(out)
-    except Exception:  # noqa: BLE001, S110 - best effort: a failed warm-up only means compiling later
-        pass
+    for T in rows:
+        cache = [
+            ArraysCache(1)
+            if layer.layer_type == "M"
+            else CacheList(KVCache(), ArraysCache(2))
+            for layer in model.layers
+        ]
+        tok = mx.zeros((T, 2), dtype=mx.int32)
+        mx.eval(model(tok, cache=cache))
+        out = model(tok[:, :1], cache=cache)
+        if isinstance(out, tuple):
+            out = head_fn(out[0])
+        mx.eval(out)
+
+
+_warmup_started = set()
 
 
 def maybe_warmup(model, head_fn):
-    """Kernels are compiled per row bucket (1 / 2 / 4 / 8); compiling a bucket takes seconds.
-    For continuous batching, compile them all once in the background, so that a new batch size
-    does not stall generation. OLALA_WARMUP=0 disables it."""
+    """Kernels are compiled per row bucket (1 / 2 / 4 / 8). For continuous batching, compile
+    them all once up front (in the calling thread: compiling from a second thread while the
+    first one evaluates crashed MLX), so that a new batch size does not stall generation.
+    OLALA_WARMUP=0 disables it."""
     if (
         os.environ.get("OLALA_WARMUP", "1") != "1"
         or id(model) in _warmup_started
@@ -2155,9 +2154,7 @@ def maybe_warmup(model, head_fn):
     ):
         return
     _warmup_started.add(id(model))
-    threading.Thread(
-        target=_warmup, args=(model, head_fn, (1, 2, 4, 8)), daemon=True
-    ).start()
+    _warmup(model, head_fn, (1, 2, 4, 8))
 
 
 def decode(model, x, cache, positions):
