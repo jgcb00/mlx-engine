@@ -1297,6 +1297,9 @@ def can_decode(model, x, cache, ssm_mask) -> bool:
         return False
     for i in model.attn_idx:
         c = cache[i]
+        if c is None or not hasattr(c, "caches"):
+            return False
+        c = c.caches[0]
         if type(c).__name__ not in ("KVCache", "BatchKVCache") or c.keys is None:
             return False
     for i in model.ssm_idx:
@@ -1401,8 +1404,6 @@ def decode(model, x, cache, positions):
     B, _, D = x.shape
     T = B
     xin = x.reshape(T, D)
-    n_layers = len(model.layers)
-    shift = dict(zip(model.attn_idx, cache[n_layers:], strict=True))
     pos = positions.reshape(T).astype(mx.int32)
 
     kstart = None  # first valid key per row (same for every attention layer)
@@ -1434,9 +1435,9 @@ def decode(model, x, cache, positions):
             resid = outs[-1]
             att = L["attn"]
             big, small = outs[0], outs[1]
-            sc = shift[li]
+            sc = cache[li].caches[1]
             Hq, Hk, Dh, Rk = att.n_heads, att.n_kv, att.head_dim, att.rank
-            kc = cache[li]
+            kc = cache[li].caches[0]
             kv_dtype = kc.keys.dtype
             if sc[0] is None:
                 kprev = mx.zeros((T, 1, Hk, Dh), mx.float32)

@@ -13,6 +13,7 @@ from mlx_engine.external.models.lfm2_vl.router_lfm2_vl_processor import (
 from transformers.models.lfm2_vl.configuration_lfm2_vl import (
     Lfm2VlConfig as HFLfm2VlConfig,
 )
+from mlx_engine.models.olala import register as register_olala
 
 
 def register_models():
@@ -32,3 +33,6 @@ def register_models():
     # [3] https://github.com/huggingface/transformers/blob/c7e5b749a6392ea2f42fea983af41f825b0bc78d/src/transformers/models/lfm2_vl/processing_lfm2_vl.py#L52
     del processing_auto.PROCESSOR_MAPPING_NAMES["lfm2_vl"]
     AutoProcessor.register(HFLfm2VlConfig, RouterLfm2VlProcessor, exist_ok=False)
+
+    # Olala (OlalaForCausalLM) is implemented here, not in mlx-lm / mlx-vlm.
+    register_olala()

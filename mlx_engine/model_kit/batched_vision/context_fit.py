@@ -540,7 +540,16 @@ def _probe_cache_fit_profile(
     fixed_ssm_bytes = 0
     cache_allocation_steps = set()
 
+    # CacheList groups several caches of one layer (e.g. a KV cache and a small state
+    # cache); account for its members individually.
+    flat_cache = []
     for cache in prompt_cache:
+        if type(cache).__name__ == "CacheList":
+            flat_cache.extend(cache.caches)
+        else:
+            flat_cache.append(cache)
+
+    for cache in flat_cache:
         cache_type = type(cache).__name__
         if cache_type not in _SUPPORTED_CACHE_TYPES:
             logger.error(

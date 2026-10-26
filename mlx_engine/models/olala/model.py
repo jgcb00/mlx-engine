@@ -16,13 +16,12 @@ large matrix-vector products:
   - MoE ``in_cat``: [down_proj | shared fc_1], ``out_cat``: [up_proj | shared fc_2]
     (concatenated along the input dimension)
 
-Cache layout (one entry per item of ``make_cache()``):
-  - layer i of type M: ArraysCache(1) holding the packed f32 state (B, H, P*N + R*N + P + A),
+Cache layout (one entry per layer):
+  - type M: ArraysCache(1) holding the packed f32 state (B, H, P*N + R*N + P + A),
     per head [ssm S (P,N) | rotated keys of the last token (R,N) | raw x of the last token (P) |
     rotary angles (A)]
-  - layer i of type V: KVCache (keys after token shift and k-norm)
-  - then one ArraysCache(2) per V layer = [k_raw, v_raw] of the last token
-    (token shift input)
+  - type V: CacheList(KVCache (keys after token shift and k-norm), ArraysCache(2) = raw k / v
+    of the last token, the token-shift input)
 """
 
 import math
@@ -34,6 +33,7 @@ import mlx.core as mx
 from mlx import nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache
+from mlx_lm.models.cache import CacheList as _MlxCacheList
 from mlx_lm.models.cache import KVCache as _MlxKVCache
 from mlx_lm.models.switch_layers import SwitchLinear
 
@@ -92,12 +92,12 @@ class ModelArgs(BaseModelArgs):
             raise ValueError("Olala: only the released attention configuration is supported")
 
 
-class KVCache(_MlxKVCache):
-    """mlx-lm KVCache that the fused decode path may append to in place.
+class InplaceAppendMixin:
+    """KVCache mixin that lets the fused decode path append to the cache in place.
 
-    mlx-lm appends with a slice update; while the previous token's command buffer is
-    in flight MLX keeps a reference to the buffer, so every append copies the whole
-    cache (measured 0.85 ms / token at 8k context for the 7 attention layers).
+    mlx-lm / mlx-vlm append with a slice update; while the previous token's command
+    buffer is in flight MLX keeps a reference to the buffer, so every append copies
+    the whole cache (measured 0.85 ms / token at 8k context for the 7 attention layers).
 
     In-place writes are only allowed at positions no one else can see: positions at
     or above the high-water mark ``_hw`` of everything ever exposed (returned views,
@@ -106,9 +106,7 @@ class KVCache(_MlxKVCache):
     in-place appends until the next regular append has given the cache its own
     buffer (copy-on-write)."""
 
-    def __init__(self):
-        super().__init__()
-        self._hw = 0
+    _hw = 0
 
     def update_and_fetch(self, keys, values):
         out = super().update_and_fetch(keys, values)
@@ -121,7 +119,7 @@ class KVCache(_MlxKVCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset = v
+        super(InplaceAppendMixin, type(self)).state.fset(self, v)
         self._hw = self.keys.shape[2] if self.keys is not None else 0
 
     def __copy__(self):
@@ -131,8 +129,8 @@ class KVCache(_MlxKVCache):
         return self._shared_copy()
 
     def _shared_copy(self):
-        c = KVCache()
-        c.keys, c.values, c.offset = self.keys, self.values, self.offset
+        c = self.__class__.__new__(self.__class__)
+        c.__dict__.update(self.__dict__)
         if self.keys is not None:
             self._hw = c._hw = self.keys.shape[2]
         return c
@@ -140,6 +138,7 @@ class KVCache(_MlxKVCache):
     def can_append_inplace(self, n: int = 1) -> bool:
         return (
             self.keys is not None
+            and isinstance(self.offset, int)
             and self.offset >= self._hw
             and self.offset + n <= self.keys.shape[2]
         )
@@ -147,6 +146,28 @@ class KVCache(_MlxKVCache):
     def commit_inplace(self, n: int = 1):
         self.offset += n
         self._hw = self.offset
+
+
+class KVCache(InplaceAppendMixin, _MlxKVCache):
+    """mlx-lm KVCache with in-place appends for the fused decode path."""
+
+
+class AttnCacheMixin:
+    """Cache of one attention layer: [KV cache, ArraysCache(2) = raw k / v of the last
+    token (token-shift input)]. One entry per layer keeps ``len(cache) == len(layers)``,
+    which mlx-engine relies on; ``offset`` / ``keys`` expose the KV cache."""
+
+    @property
+    def offset(self):
+        return self.caches[0].offset
+
+    @property
+    def keys(self):
+        return self.caches[0].keys
+
+
+class CacheList(AttnCacheMixin, _MlxCacheList):
+    pass
 
 
 def _zc(weight: mx.array, zero_centered: bool) -> mx.array:
@@ -431,12 +452,10 @@ class OlalaModel(nn.Module):
         x = inputs_embeds.astype(mx.float32)
         B, L, _ = x.shape
 
-        n_layers = len(self.layers)
         if cache is None:
-            cache = [None] * (n_layers + len(self.attn_idx))
-        shift = dict(zip(self.attn_idx, cache[n_layers:], strict=True))
+            cache = [None] * len(self.layers)
 
-        kv0 = cache[self.attn_idx[0]] if self.attn_idx else None
+        kv0 = cache[self.attn_idx[0]][0] if self.attn_idx and cache[self.attn_idx[0]] is not None else None
         positions = _positions(kv0, B, L)
         c_ssm = cache[self.ssm_idx[0]] if self.ssm_idx else None
         ssm_mask = c_ssm.make_mask(L) if c_ssm is not None and hasattr(c_ssm, "make_mask") else None
@@ -453,8 +472,14 @@ class OlalaModel(nn.Module):
             if layer.layer_type == "M":
                 x = layer(x, dtype, cache=cache[i], mask=ssm_mask)
             else:
+                c = cache[i]
                 x = layer(
-                    x, dtype, cache=cache[i], shift_cache=shift[i], mask=attn_mask, positions=positions
+                    x,
+                    dtype,
+                    cache=None if c is None else c[0],
+                    shift_cache=None if c is None else c[1],
+                    mask=attn_mask,
+                    positions=positions,
                 )
         return x
 
@@ -507,9 +532,10 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self) -> list[Any]:
-        caches = [ArraysCache(1) if layer.layer_type == "M" else KVCache() for layer in self.model.layers]
-        caches.extend(ArraysCache(2) for _ in self.model.attn_idx)
-        return caches
+        return [
+            ArraysCache(1) if layer.layer_type == "M" else CacheList(KVCache(), ArraysCache(2))
+            for layer in self.model.layers
+        ]
 
     def sanitize(self, weights: dict) -> dict:
         """Map a HF checkpoint (or an already converted MLX one) to this module tree."""
