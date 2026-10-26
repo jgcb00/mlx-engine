@@ -136,6 +136,47 @@ def _dot_code(fmt, name, K, gs, xexpr, tdim, rowvar, kvar):
     return "\n".join(lines)
 
 
+def _reg_load(fmt, name, K, gs):
+    """Load one 16-byte chunk of row lr at column k into wv[c] (and the group scale / bias)."""
+    if fmt in ("bf16", "f16", "f32"):
+        return f"wv[c] = *(const device uint4*)({name} + (size_t)lr * {K} + k);"
+    div = 4 if fmt == "q8" else 8
+    return (
+        f"wv[c] = *(const device uint4*)({name} + (size_t)lr * ({K} / {div}) + k / {div}); "
+        f"sbv[c] = float2({name}_s[(size_t)lr * ({K} / {gs}) + k / {gs}], {name}_b[(size_t)lr * ({K} / {gs}) + k / {gs}]);"
+    )
+
+
+def _reg_fma(fmt, xexpr, T):
+    """acc[t] += dot(chunk wv[c] at column k, x[t, k:k+chunk])."""
+    if fmt in ("bf16", "f16"):
+        vt = "bfloat4" if fmt == "bf16" else "half4"
+        return (
+            f"{{ const uint4 u = wv[c]; const float4 a0 = float4(as_type<{vt}>(uint2(u.x, u.y))), "
+            f"a1 = float4(as_type<{vt}>(uint2(u.z, u.w)));\n"
+            f"for (int t = 0; t < {T}; ++t) acc[t] += dot(a0, {xexpr('t', 0)}) + dot(a1, {xexpr('t', 1)}); }}"
+        )
+    if fmt == "f32":
+        return f"{{ const float4 a0 = as_type<float4>(wv[c]); for (int t = 0; t < {T}; ++t) acc[t] += dot(a0, {xexpr('t', 0)}); }}"
+    if fmt == "q8":
+        return (
+            "{ const uint4 u = wv[c]; float4 f[4];\n"
+            "for (int j = 0; j < 4; ++j) { const uint q = u[j]; f[j] = float4(q & 0xffu, (q >> 8) & 0xffu, (q >> 16) & 0xffu, q >> 24); }\n"
+            f"for (int t = 0; t < {T}; ++t) {{ float s1 = 0, s2 = 0;\n"
+            f"  for (int j = 0; j < 4; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}\n"
+            "  acc[t] += sbv[c].x * s1 + sbv[c].y * s2; } }"
+        )
+    return (
+        "{ const uint4 u = wv[c]; float4 f[8];\n"
+        "for (int j = 0; j < 4; ++j) { const uint q = u[j]; "
+        "f[2*j] = float4(q & 0xfu, (q >> 4) & 0xfu, (q >> 8) & 0xfu, (q >> 12) & 0xfu); "
+        "f[2*j+1] = float4((q >> 16) & 0xfu, (q >> 20) & 0xfu, (q >> 24) & 0xfu, q >> 28); }\n"
+        f"for (int t = 0; t < {T}; ++t) {{ float s1 = 0, s2 = 0;\n"
+        f"  for (int j = 0; j < 8; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}\n"
+        "  acc[t] += sbv[c].x * s1 + sbv[c].y * s2; } }"
+    )
+
+
 # --------------------------------------------------------------------------
 # GEMV with fused prologue
 # --------------------------------------------------------------------------
@@ -144,50 +185,54 @@ _kernels = {}
 
 
 def _geo_prologue(K, T, LI):
-    """xs[t] = geodesic(xin[t], g[t]); also written to xout by threadgroup 0."""
+    """xs[t] = geodesic(xin[t], g[t]); also written to xout by threadgroup 0.
+    x and g are read once into registers (EPT elements per thread)."""
     if os.environ.get("OLALA_NOGEO") == "1":  # profiling only: same inputs, no math
         return f"""
     for (uint i = tid; i < {T} * {K}; i += {NSG} * 32) {{ xs[i] = xin[i] + g[i] * geo[0]; if (tgid == 0) xout[i] = xs[i]; }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
     """
+    NT = NSG * 32
+    EPT = (K + NT - 1) // NT
     return f"""
     {{
-    threadgroup float red[3 * {NSG}];
+    threadgroup float red[3][{NSG}];
     const float scale = geo[0], gbias = geo[1];
     for (int t = 0; t < {T}; ++t) {{
+        float av[{EPT}], bv[{EPT}];
         float sxx = 0, sxg = 0;
-        for (uint i = tid; i < {K}; i += {NSG} * 32) {{
-            const float a = xin[t * {K} + i], b = g[t * {K} + i];
-            sxx += a * a; sxg += a * b;
+        for (int j = 0; j < {EPT}; ++j) {{
+            const uint i = tid + j * {NT};
+            av[j] = i < {K} ? xin[t * {K} + i] : 0.0f;
+            bv[j] = i < {K} ? g[t * {K} + i] : 0.0f;
+            sxx += av[j] * av[j]; sxg += av[j] * bv[j];
         }}
         sxx = simd_sum(sxx); sxg = simd_sum(sxg);
-        if (lane == 0) {{ red[sg] = sxx; red[{NSG} + sg] = sxg; }}
+        if (lane == 0) {{ red[0][sg] = sxx; red[1][sg] = sxg; }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         sxx = 0; sxg = 0;
-        for (int i = 0; i < {NSG}; ++i) {{ sxx += red[i]; sxg += red[{NSG} + i]; }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = 0; i < {NSG}; ++i) {{ sxx += red[0][i]; sxg += red[1][i]; }}
         const float xx = max(sxx, 1e-12f);
         const float proj = sxg / xx;
         float sgg = 0;
-        for (uint i = tid; i < {K}; i += {NSG} * 32) {{
-            const float gr = g[t * {K} + i] - proj * xin[t * {K} + i];
-            sgg += gr * gr;
-        }}
+        for (int j = 0; j < {EPT}; ++j) {{ const float gr = bv[j] - proj * av[j]; sgg += gr * gr; }}
         sgg = simd_sum(sgg);
-        if (lane == 0) red[2 * {NSG} + sg] = sgg;
+        if (lane == 0) red[2][sg] = sgg;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         sgg = 0;
-        for (int i = 0; i < {NSG}; ++i) sgg += red[2 * {NSG} + i];
+        for (int i = 0; i < {NSG}; ++i) sgg += red[2][i];
         const float tn = max(sqrt(sgg), 1e-8f);
         const float rr = max(sqrt(xx), 1e-6f);
         float theta = min(tn / rr, {math.pi / 4}f);
         theta = min((theta * scale + gbias) / {LI + 1}.0f, {math.pi / 4}f);
         const float c = cos(theta), s = sin(theta) * rr / tn;
-        for (uint i = tid; i < {K}; i += {NSG} * 32) {{
-            const float a = xin[t * {K} + i];
-            const float v = a * c + (g[t * {K} + i] - proj * a) * s;
-            xs[t * {K} + i] = v;
-            if (tgid == 0) xout[t * {K} + i] = v;
+        for (int j = 0; j < {EPT}; ++j) {{
+            const uint i = tid + j * {NT};
+            if (i < {K}) {{
+                const float v = av[j] * c + (bv[j] - proj * av[j]) * s;
+                xs[t * {K} + i] = v;
+                if (tgid == 0) xout[t * {K} + i] = v;
+            }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
@@ -305,6 +350,8 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
     }[prologue]()
 
     total = sum(s[2] for s in segs)
+    if RPS == 1 and os.environ.get("OLALA_PRELOAD", "0") == "1":
+        return _gemv_kernel_preload(key, K, T, segs, inputs, outputs, decl, pro, xexpr, total, step)
     body = []
     off = 0
     for j, (fmt, gs, rows) in enumerate(segs):
@@ -358,6 +405,58 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
     return _kernels[key]
 
 
+def _gemv_kernel_preload(key, K, T, segs, inputs, outputs, decl, pro, xexpr, total, step):
+    """One row per simdgroup; every weight chunk of the row is loaded into registers before
+    the prologue runs, so the DRAM latency overlaps the prologue."""
+    maxch = max((K + _chunk(f) * 32 - 1) // (_chunk(f) * 32) for f, _, _ in segs)
+    pre, body, outs = [], [], []
+    off = 0
+    for j, (fmt, gs, rows) in enumerate(segs):
+        ch = _chunk(fmt)
+        nch = (K + ch * 32 - 1) // (ch * 32)
+        cond = f"row >= {off} && row < {off + rows}"
+        pre.append(f"""
+        if ({cond}) {{
+            const int lr = row - {off};
+            for (int c = 0; c < {nch}; ++c) {{ const int k = (lane + 32 * c) * {ch}; if (k < {K}) {{ {_reg_load(fmt, f"w{j}", K, gs)} }} }}
+        }}""")
+        body.append(f"""
+        if ({cond}) {{
+            for (int c = 0; c < {nch}; ++c) {{ const int k = (lane + 32 * c) * {ch}; if (k < {K}) {_reg_fma(fmt, xexpr, T)} }}
+        }}""")
+        outs.append(f"if ({cond}) y{j}[t * {rows} + row - {off}] = v;")
+        off += rows
+    src = f"""
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint sg = tid / 32, lane = tid % 32;
+    const uint tgid = threadgroup_position_in_grid.x;
+    const int row = tgid * {NSG} + sg;
+    uint4 wv[{maxch}];
+    float2 sbv[{maxch}];
+    {"".join(pre)}
+    {decl}
+    {pro}
+    float acc[{T}];
+    for (int t = 0; t < {T}; ++t) acc[t] = 0;
+    {"".join(body)}
+    if (row < {total}) {{
+        for (int t = 0; t < {T}; ++t) {{
+            const float v = simd_sum(acc[t]);
+            if (lane == 0) {{ {" ".join(outs)} }}
+        }}
+    }}
+    """
+    k = mx.fast.metal_kernel(
+        name=f"olala_gemvp_{abs(hash(key)) % 10**12}",
+        input_names=inputs,
+        output_names=outputs,
+        source=src,
+        header=_HDR,
+    )
+    _kernels[key] = (k, total, step)
+    return _kernels[key]
+
+
 def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RPS=None):
     RPS = RPS or int(os.environ.get("OLALA_RPS", "1"))
     """Run a fused GEMV. x_inputs: list of input arrays for the prologue. ws: list of W.
@@ -372,11 +471,12 @@ def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RP
             x = x_inputs[0]
             xs = x / mx.maximum(mx.sqrt(mx.sum(x * x, axis=-1, keepdims=True)), 1e-12)
         return gemv([xs], ws, T=T, K=K, RPS=RPS) + [xs]
-    if prologue == "moecat" and T * K * 4 > TG_X_BYTES:
+    if prologue == "moecat" and (T * K * 4 > TG_X_BYTES or os.environ.get("OLALA_MOE_REDUCE") == "1"):
         parts, b = x_inputs
         e = parts.sum(axis=1)  # (T, Ka)
         return gemv([e, b], ws, prologue="relu2cat", Ka=Ka, sa=Ka, sb=sb, T=T, K=K, RPS=RPS)
-    x_in_tg = prologue in ("geo", "norm", "moecat") or (prologue == "plain" and T * K * 4 <= TG_X_BYTES)
+    x_in_tg = prologue in ("geo", "norm", "moecat") or (
+        prologue == "plain" and T * K * 4 <= TG_X_BYTES and os.environ.get("OLALA_PLAIN_TG", "0") == "1")
     kern, total, _ = gemv_kernel(K, T, segs, prologue, LI, Ka, sa, sb, x_in_tg, RPS)
     ntg = (total + NSG * RPS - 1) // (NSG * RPS)
     if _TINY and _tiny():
@@ -427,7 +527,7 @@ def geodesic(xin, g, geo, LI, T, K):
 # Mamba-3 MIMO decode step
 # --------------------------------------------------------------------------
 
-M3_PB = 16  # state rows (p) per threadgroup
+M3_PB = int(os.environ.get("OLALA_M3_PB", "64"))  # state rows (p) per threadgroup
 
 
 def m3_param_pack(m):
@@ -443,23 +543,29 @@ def m3_param_pack(m):
 
 def m3_step(proj, prm, st, H, P, N, R, A, n_static):
     """proj: (T, n_static + n_dyn) f32 (one token per batch row); prm: m3_param_pack();
-    st: packed state (T, H, P*N + R*N + P + A) f32. Returns y (T, H*P) and the new state."""
+    st: packed state (T, H, P*N + R*N + P + A) f32. Returns y (T, H*P) and the new state.
+
+    Threadgroup = (row b, head h, block of PB state rows), 16 simdgroups. Simdgroups 0..2R-1
+    normalize / bias / rotate one row of [B | C] each in registers; the others build v, w and
+    the previous v for the block; every device load is issued before the single barrier; then
+    one simdgroup sweeps one state row (lane = 4 consecutive state columns)."""
     T = proj.shape[0]
     SW = P * N + R * N + P + A
-    key = ("m3", T, H, P, N, R, A, n_static)
+    PB = M3_PB
+    NSG_ = 16
+    key = ("m3v2", T, H, P, N, R, A, n_static, PB)
     if key not in _kernels:
-        PB = M3_PB
-        NJ = N // 32
+        assert N == 128 and A == 32 and 2 * R <= NSG_ and PB % NSG_ == 0
         src = f"""
-        constexpr int H = {H}, P = {P}, N = {N}, R = {R}, A = {A}, PB = {PB}, NJ = {NJ};
+        constexpr int H = {H}, P = {P}, N = {N}, R = {R}, A = {A}, PB = {PB}, NSGM = {NSG_};
         constexpr int PH = 2 * P + 3, NS = {n_static}, PW = {n_static} + 2 * R * N + A;
         constexpr int SW = {SW}, OK_ = P * N, OX = OK_ + R * N, OA = OX + P;
-        // packed parameters
         constexpr int O_DT = 0, O_D = H, O_BN = 2 * H, O_CN = O_BN + N, O_BB = O_CN + N, O_CB = O_BB + H * R * N;
         constexpr int O_MX = O_CB + H * R * N, O_MZ = O_MX + H * R * P, O_MO = O_MZ + H * R * P;
+        constexpr int RPSG = PB / NSGM;
         const uint tid = thread_position_in_threadgroup.x;
         const uint sg = tid / 32, lane = tid % 32;
-        const uint blk = threadgroup_position_in_grid.x;   // (b, h, pblock)
+        const uint blk = threadgroup_position_in_grid.x;
         const int npb = P / PB;
         const int b = blk / (H * npb);
         const int h = (blk / npb) % H;
@@ -470,10 +576,14 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static):
         const device float* sin_ = st + ((size_t)b * H + h) * SW;
         device float* sout = st_out + ((size_t)b * H + h) * SW;
 
-        threadgroup float kq[2 * R * N];      // k (rotated) | q (rotated)
-        threadgroup float th[A];
-        threadgroup float rs[2 * R];
-        threadgroup float vw[3 * R * PB];     // v | w | vprev  for this p block
+        threadgroup float4 kqs[2 * R][N / 4];
+        threadgroup float vws[3][R][PB];
+
+        // early loads for the sweep (independent of the prep)
+        float4 srow[RPSG];
+        for (int i = 0; i < RPSG; ++i) srow[i] = ((const device float4*)(sin_ + (pb * PB + sg + NSGM * i) * N))[lane];
+        float4 kp[R];
+        for (int r = 0; r < R; ++r) kp[r] = ((const device float4*)(sin_ + OK_ + r * N))[lane];
 
         const float dt = olala_softplus(ph[2 * P] + prm[O_DT + h]);
         const float a = min(-olala_softplus(ph[2 * P + 1]), -1e-4f);
@@ -482,88 +592,74 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static):
         const float beta = (1.0f - trap) * dt * alpha;
         const float gamma = trap * dt;
 
-        if (tid < A) {{
-            float th0 = sin_[OA + tid] + tanh(dyn[2 * R * N + tid]) * {math.pi}f * dt;
-            th0 = th0 - {2 * math.pi}f * rint(th0 * {0.5 / math.pi}f);
-            th[tid] = th0;
-            if (pb == 0) sout[OA + tid] = th0;
-        }}
-        for (int gidx = sg; gidx < 2 * R; gidx += 4) {{
-            float s = 0;
-            for (int n = lane; n < N; n += 32) {{ const float u = dyn[gidx * N + n]; s += u * u; }}
-            s = simd_sum(s);
-            if (lane == 0) rs[gidx] = rsqrt(s / N + {1e-6}f);
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = tid; i < 2 * R * N; i += 128) {{
-            const int gidx = i / N, n = i % N;
-            const bool isq = gidx >= R;
-            const int r = isq ? gidx - R : gidx;
-            const float wn = prm[(isq ? O_CN : O_BN) + n];
-            const float bb = prm[(isq ? O_CB : O_BB) + (h * R + r) * N + n];
-            kq[i] = dyn[i] * rs[gidx] * wn + bb;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = tid; i < 2 * R * A; i += 128) {{
-            const int gidx = i / A, j = i % A;
-            const float c = cos(th[j]), s = sin(th[j]);
-            threadgroup float* row = kq + gidx * N;
-            const float u0 = row[j], u2 = row[j + 2 * A];
-            row[j] = u0 * c - u2 * s;
-            row[j + 2 * A] = u0 * s + u2 * c;
-        }}
-        for (int i = tid; i < R * PB; i += 128) {{
-            const int r = i / PB, pl = i % PB, p = pb * PB + pl;
-            const float mxv = prm[O_MX + (h * R + r) * P + p];
-            const float xv = ph[P + p];
-            const float zz = ph[p] * prm[O_MZ + (h * R + r) * P + p];
-            vw[i] = xv * mxv;
-            vw[R * PB + i] = zz / (1.0f + exp(-zz)) * prm[O_MO + (h * R + r) * P + p];
-            vw[2 * R * PB + i] = sin_[OX + p] * mxv;
+        if (sg < 2 * R) {{
+            const int gi = sg;
+            const bool isq = gi >= R;
+            const int r = isq ? gi - R : gi;
+            const float4 u = ((const device float4*)(dyn + gi * N))[lane];
+            const float4 wn = ((const device float4*)(prm + (isq ? O_CN : O_BN)))[lane];
+            const float4 bb = ((const device float4*)(prm + (isq ? O_CB : O_BB) + (h * R + r) * N))[lane];
+            // rotary angle of this lane (A == 32): wrapped cumulative angle
+            float thl = sin_[OA + lane] + tanh(dyn[2 * R * N + lane]) * {math.pi}f * dt;
+            thl = thl - {2 * math.pi}f * rint(thl * {0.5 / math.pi}f);
+            if (gi == 0 && pb == 0) sout[OA + lane] = thl;
+            const float ss = simd_sum(dot(u, u));
+            float4 val = u * rsqrt(ss / N + {1e-6}f) * wn + bb;
+            // rotate pairs (n, n + 64) for n < 32: lanes 0..7 hold n = 0..31, lanes 16..23 hold n = 64..95
+            const float4 partner = simd_shuffle_xor(val, 16);
+            const int base = 4 * (lane & 15);
+            const float4 th4 = float4(simd_shuffle(thl, (base + 0) & 31), simd_shuffle(thl, (base + 1) & 31),
+                                      simd_shuffle(thl, (base + 2) & 31), simd_shuffle(thl, (base + 3) & 31));
+            if ((lane & 15) < 8) {{
+                const float4 c = cos(th4), s = sin(th4);
+                val = (lane < 16) ? (val * c - partner * s) : (partner * s + val * c);
+            }}
+            kqs[gi][lane] = val;
+            if (!isq && pb == 0) ((device float4*)(sout + OK_ + r * N))[lane] = val;
+        }} else {{
+            for (int i = tid - 2 * R * 32; i < R * PB; i += (NSGM - 2 * R) * 32) {{
+                const int r = i / PB, pl = i % PB, p = pb * PB + pl;
+                const float mxv = prm[O_MX + (h * R + r) * P + p];
+                const float xv = ph[P + p];
+                const float zz = ph[p] * prm[O_MZ + (h * R + r) * P + p];
+                vws[0][r][pl] = xv * mxv;
+                vws[1][r][pl] = zz / (1.0f + exp(-zz)) * prm[O_MO + (h * R + r) * P + p];
+                vws[2][r][pl] = sin_[OX + p] * mxv;
+                if (r == 0) sout[OX + p] = xv;
+            }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (pb == 0) {{
-            for (int i = tid; i < R * N; i += 128) sout[OK_ + i] = kq[i];
-        }}
-        for (int i = tid; i < PB; i += 128) sout[OX + pb * PB + i] = ph[P + pb * PB + i];
+        float4 kr[R], qr[R];
+        for (int r = 0; r < R; ++r) {{ kr[r] = kqs[r][lane]; qr[r] = kqs[R + r][lane]; }}
         const float Dh = prm[O_D + h];
-        for (int pl = sg; pl < PB; pl += 4) {{
-            const int p = pb * PB + pl;
-            float acc = 0;
-            for (int j = 0; j < NJ; ++j) {{
-                const int n = lane + 32 * j;
-                float kv = 0, kvp = 0, qw = 0;
-                for (int r = 0; r < R; ++r) {{
-                    kv  += vw[r * PB + pl] * kq[r * N + n];
-                    kvp += vw[2 * R * PB + r * PB + pl] * sin_[OK_ + r * N + n];
-                    qw  += vw[R * PB + r * PB + pl] * kq[(R + r) * N + n];
-                }}
-                float s = sin_[p * N + n];
-                s = alpha * s + beta * kvp + gamma * kv;
-                sout[p * N + n] = s;
-                acc += s * qw;
+        for (int i = 0; i < RPSG; ++i) {{
+            const int pl = sg + NSGM * i, p = pb * PB + pl;
+            float4 kv = 0, kvp = 0, qw = 0;
+            float d = 0;
+            for (int r = 0; r < R; ++r) {{
+                const float vv = vws[0][r][pl], ww = vws[1][r][pl], vp = vws[2][r][pl];
+                kv += vv * kr[r]; kvp += vp * kp[r]; qw += ww * qr[r];
+                d += ww * vv;
             }}
-            acc = simd_sum(acc);
-            if (lane == 0) {{
-                float d = 0;
-                for (int r = 0; r < R; ++r) d += vw[R * PB + r * PB + pl] * vw[r * PB + pl];
-                y[(size_t)b * H * P + h * P + p] = acc + Dh * d;
-            }}
+            const float4 s = alpha * srow[i] + beta * kvp + gamma * kv;
+            ((device float4*)(sout + p * N))[lane] = s;
+            const float acc = simd_sum(dot(s, qw));
+            if (lane == 0) y[(size_t)b * H * P + h * P + p] = acc + Dh * d;
         }}
         """
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"olala_m3_step_{T}",
+            name=f"olala_m3v2_{T}_{PB}",
             input_names=["proj", "prm", "st"],
             output_names=["y", "st_out"],
             source=src,
             header=_HDR,
         )
     kern = _kernels[key]
-    npb = P // M3_PB
+    npb = P // PB
     return kern(
         inputs=[proj, prm, st],
-        grid=(128 if _tiny("m3") else T * H * npb * 128, 1, 1),
-        threadgroup=(128, 1, 1),
+        grid=(NSG_ * 32 if _tiny("m3") else T * H * npb * NSG_ * 32, 1, 1),
+        threadgroup=(NSG_ * 32, 1, 1),
         output_shapes=[(T, H * P), (T, H, SW)],
         output_dtypes=[mx.float32] * 2,
     )
@@ -662,44 +758,10 @@ def moe_up(logits, ebias, x0, x0_stride, we: W, top_k, scaling, T):
     )
 
 
-MOE_FB = 64  # expert hidden units per threadgroup in moe_fused
-
-
-def moe_fused(logits, ebias, x0, x0_stride, wu: W, wd: W, top_k, scaling, T):
-    """Routed experts in one kernel. Threadgroup (t, k, block) computes
-    h = relu(W1[e_k][block] x0[t])^2 * p_k for MOE_FB hidden units and its contribution
-    W2[e_k][:, block] h to the expert output. Returns partial sums (T, top_k * NB, D)."""
-    E, F, D = wu.w.shape[0], wu.rows, wu.cols
-    FB = MOE_FB
-    NB = F // FB
-    chu, chd = _chunk(wu.fmt), _chunk(wd.fmt)
-    LPRU = 8 if (D // chu) % 8 == 0 else 4
-    LPRD = min(32, FB // chd)
-    key = ("moe_fused", E, F, D, wu.key(), wd.key(), top_k, T, FB)
-    if key not in _kernels:
-        def xu(t, j):
-            return f"*(const threadgroup float4*)(xs + k + 4 * ({j}))"
-
-        def xd(t, j):
-            return f"*(const threadgroup float4*)(hs + (k - f0) + 4 * ({j}))"
-        dotu = _dot_code(wu.fmt, "wu", D, wu.gs or 0, xu, 1, "erow", "k").replace("acc[r][t]", "acc")
-        dotd = _dot_code(wd.fmt, "wd", F, wd.gs or 0, xd, 1, "erow", "k").replace("acc[r][t]", "acc")
-        src = f"""
-        constexpr int E = {E}, F = {F}, D = {D}, TOPK = {top_k}, FB = {FB}, NB = {NB};
-        constexpr int LPRU = {LPRU}, LPRD = {LPRD};
-        const uint tid = thread_position_in_threadgroup.x;
-        const uint sg = tid / 32, lane = tid % 32;
-        const uint blk = threadgroup_position_in_grid.x;
-        const int t = blk / (TOPK * NB);
-        const int kk = (blk / NB) % TOPK;
-        const int fb = blk % NB;
-        const int f0 = fb * FB;
-        threadgroup float xs[D];
-        threadgroup float hs[FB];
-        threadgroup int sel_idx[TOPK];
-        threadgroup float sel_p[TOPK];
-        for (int i = tid; i < D; i += {NSG} * 32) xs[i] = x0[t * {x0_stride} + i];
-        if (sg == 0) {{
+def _topk_code(top_k, scaling):
+    if os.environ.get("OLALA_FAKE_TOPK") == "1":  # profiling only
+        return f"if (lane < {top_k}) {{ sel_idx[lane] = lane * 37 + int(logits[t * E] > 1e30f); sel_p[lane] = 0.4f; }}"
+    return f"""
             float sc[E / 32], sv[E / 32];
             for (int j = 0; j < E / 32; ++j) {{
                 const int e = lane + 32 * j;
@@ -719,45 +781,136 @@ def moe_fused(logits, ebias, x0, x0_stride, wu: W, wd: W, top_k, scaling, T):
                 if (lane == 0) {{ sel_idx[q] = e; sel_p[q] = pv; }}
                 psum += pv;
             }}
-            if (lane == 0) for (int q = 0; q < TOPK; ++q) sel_p[q] = sel_p[q] / (psum + 1e-20f) * {scaling}f;
+            if (lane == 0) for (int q = 0; q < TOPK; ++q) sel_p[q] = sel_p[q] / (psum + 1e-20f) * {scaling}f;"""
+
+
+# Routed-expert outputs: 1 = float atomics into one (T, D) buffer (fastest; the summation order
+# of the 72 partials per output varies between runs), 0 = per-threadgroup partials summed in a
+# fixed order by the next GEMV (bit-reproducible). OLALA_DETERMINISTIC=1 selects 0.
+_MOE_ATOMIC = int(os.environ.get("OLALA_MOE_ATOMIC", "0" if os.environ.get("OLALA_DETERMINISTIC") == "1" else "1"))
+
+
+def _last_block_code():
+    """The last threadgroup of token t to finish sums the TOPK * NB partials in a fixed order."""
+    return """
+        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup bool is_last;
+        if (tid == 0) {
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            const uint done = atomic_fetch_add_explicit(&ctr[t], 1u, memory_order_relaxed);
+            is_last = done == TOPK * NB - 1;
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (is_last) {
+            for (int o = tid; o < D; o += NT) {
+                float v = 0;
+                for (int p = 0; p < TOPK * NB; ++p) v += atomic_load_explicit(&parts[((size_t)t * TOPK * NB + p) * D + o], memory_order_relaxed);
+                atomic_store_explicit(&eout[(size_t)t * D + o], v, memory_order_relaxed);
+            }
+        }
+    """
+MOE_FB = int(os.environ.get("OLALA_MOE_FB", "64"))  # expert hidden units per threadgroup in moe_fused
+
+
+def moe_fused(logits, ebias, x0, x0_stride, wu: W, wd: W, top_k, scaling, T):
+    """Routed experts in one kernel. Threadgroup (t, k, block) computes
+    h = relu(W1[e_k][block] x0[t])^2 * p_k for MOE_FB hidden units and its contribution
+    W2[e_k][:, block] h to the expert output. Returns partial sums (T, top_k * NB, D).
+
+    Latency-oriented: simdgroup 0 selects the experts while the others stage x0; phase 1
+    uses LPRU lanes per hidden unit in a single pass; phase 2 gives each thread whole
+    outputs, so every weight load of a phase is independent."""
+    E, F, D = wu.w.shape[0], wu.rows, wu.cols
+    FB = MOE_FB
+    NB = F // FB
+    chu, chd = _chunk(wu.fmt), _chunk(wd.fmt)
+    NT = NSG * 32
+    LPRU = max(1, min(32, (NT * (D // chu)) // (FB * max(1, D // chu)) if False else NT // FB))
+    while LPRU > 1 and (D // chu) % LPRU:
+        LPRU //= 2
+    key = ("moe_fused2", E, F, D, wu.key(), wd.key(), top_k, T, FB, NSG)
+    if key not in _kernels:
+        def xu(t, j):
+            return f"*(const threadgroup float4*)(xs + k + 4 * ({j}))"
+
+        def xd(t, j):
+            return f"*(const threadgroup float4*)(hs + (k - f0) + 4 * ({j}))"
+        dotu = _dot_code(wu.fmt, "wu", D, wu.gs or 0, xu, 1, "erow", "k").replace("acc[r][t]", "acc")
+        dotd = _dot_code(wd.fmt, "wd", F, wd.gs or 0, xd, 1, "erow", "k").replace("acc[r][t]", "acc")
+        src = f"""
+        constexpr int E = {E}, F = {F}, D = {D}, TOPK = {top_k}, FB = {FB}, NB = {NB}, NT = {NT}, LPRU = {LPRU};
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint sg = tid / 32, lane = tid % 32;
+        const uint blk = threadgroup_position_in_grid.x;
+        const int t = blk / (TOPK * NB);
+        const int kk = (blk / NB) % TOPK;
+        const int fb = blk % NB;
+        const int f0 = fb * FB;
+        threadgroup float xs[D];
+        threadgroup float hs[FB];
+        threadgroup int sel_idx[TOPK];
+        threadgroup float sel_p[TOPK];
+        if (sg == 0) {{
+            {_topk_code(top_k, scaling)}
+        }} else {{
+            for (int i = tid - 32; i < D; i += NT - 32) xs[i] = x0[t * {x0_stride} + i];
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const int e = sel_idx[kk];
         const float pk = sel_p[kk];
-        // phase 1: FB hidden units, LPRU lanes per unit
+        // phase 1: hidden unit f = tid / LPRU, LPRU lanes split D
         {{
-            const int sub = lane / LPRU, sl = lane % LPRU;
-            for (int f = sg * (32 / LPRU) + sub; f < FB; f += {NSG} * (32 / LPRU)) {{
+            const int f = tid / LPRU, sl = tid % LPRU;
+            float acc = 0;
+            if (f < FB) {{
                 const int erow = e * F + f0 + f;
-                float acc = 0;
                 for (int k = sl * {chu}; k < D; k += LPRU * {chu}) {{
                     {dotu}
                 }}
-                for (int o = LPRU / 2; o > 0; o /= 2) acc += simd_shuffle_xor(acc, o);
-                if (sl == 0) {{ const float u = max(acc, 0.0f); hs[f] = u * u * pk; }}
             }}
+            for (int o = LPRU / 2; o > 0; o /= 2) acc += simd_shuffle_xor(acc, o);
+            if (sl == 0 && f < FB) {{ const float u = max(acc, 0.0f); hs[f] = u * u * pk; }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // phase 2: D outputs, each a dot over this block of FB hidden units
-        {{
-            const int sub = lane / LPRD, sl = lane % LPRD;
-            for (int o = sg * (32 / LPRD) + sub; o < D; o += {NSG} * (32 / LPRD)) {{
-                const int erow = e * D + o;
-                float acc = 0;
-                for (int k = f0 + sl * {chd}; k < f0 + FB; k += LPRD * {chd}) {{
-                    {dotd}
-                }}
-                for (int s2 = LPRD / 2; s2 > 0; s2 /= 2) acc += simd_shuffle_xor(acc, s2);
-                if (sl == 0) parts[((size_t)t * TOPK * NB + kk * NB + fb) * D + o] = acc;
+        // phase 2: thread o computes output o over this block's FB hidden units
+        for (int o = tid; o < D; o += NT) {{
+            const int erow = e * D + o;
+            float acc = 0;
+            for (int k = f0; k < f0 + FB; k += {chd}) {{
+                {dotd}
             }}
+            {"atomic_fetch_add_explicit(&parts[(size_t)t * D + o], acc, memory_order_relaxed);" if _MOE_ATOMIC == 1 else
+             "atomic_store_explicit(&parts[((size_t)t * TOPK * NB + kk * NB + fb) * D + o], acc, memory_order_relaxed);" if _MOE_ATOMIC == 2 else
+             "parts[((size_t)t * TOPK * NB + kk * NB + fb) * D + o] = acc;"}
         }}
+        {_last_block_code() if _MOE_ATOMIC == 2 else ""}
         """
         names = ["logits", "ebias", "x0", "wu"] + (["wu_s", "wu_b"] if wu.fmt.startswith("q") else []) + ["wd"] + (
             ["wd_s", "wd_b"] if wd.fmt.startswith("q") else [])
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"olala_moe_fused_{abs(hash(key)) % 10**12}", input_names=names,
-            output_names=["parts"], source=src, header=_HDR,
+            name=f"olala_moe_fused2_{abs(hash(key)) % 10**12}a{_MOE_ATOMIC}", input_names=names,
+            output_names=["parts", "eout", "ctr"] if _MOE_ATOMIC == 2 else ["parts"], source=src, header=_HDR,
+            atomic_outputs=bool(_MOE_ATOMIC),
         )
+    if _MOE_ATOMIC == 2:
+        return _kernels[key](
+            inputs=[logits, ebias, x0] + wu.arrays() + wd.arrays(),
+            grid=(T * top_k * NB * NSG * 32, 1, 1),
+            threadgroup=(NSG * 32, 1, 1),
+            output_shapes=[(T, top_k * NB, D), (T, D), (T,)],
+            output_dtypes=[mx.float32, mx.float32, mx.uint32],
+            init_value=0,
+        )[1]
+    if _MOE_ATOMIC:
+        return _kernels[key](
+            inputs=[logits, ebias, x0] + wu.arrays() + wd.arrays(),
+            grid=(T * top_k * NB * NSG * 32, 1, 1),
+            threadgroup=(NSG * 32, 1, 1),
+            output_shapes=[(T, D)],
+            output_dtypes=[mx.float32],
+            init_value=0,
+        )[0]
     return _kernels[key](
         inputs=[logits, ebias, x0] + wu.arrays() + wd.arrays(),
         grid=(NSG * 32 if _tiny("moe") else T * top_k * NB * NSG * 32, 1, 1),
@@ -1173,8 +1326,12 @@ def _moe_block(L, resid, gmix, T, D):
     else:
         parts = _k("moe", li, moe_fused, logits, L["ebias"], hcat, hcat.shape[1], L["up"], L["down"], moe.top_k,
                    moe.scaling, T)
-        g = _k("out_cat", li, gemv, [parts, hcat], [L["out_cat"]], prologue="moecat", Ka=moe.d_latent,
-               sa=parts.shape[1], sb=hcat.shape[1], T=T, K=moe.d_latent + moe.d_shared)[0]
+        if _MOE_ATOMIC:
+            g = _k("out_cat", li, gemv, [parts, hcat], [L["out_cat"]], prologue="relu2cat", Ka=moe.d_latent,
+                   sa=moe.d_latent, sb=hcat.shape[1], T=T, K=moe.d_latent + moe.d_shared)[0]
+        else:
+            g = _k("out_cat", li, gemv, [parts, hcat], [L["out_cat"]], prologue="moecat", Ka=moe.d_latent,
+                   sa=parts.shape[1], sb=hcat.shape[1], T=T, K=moe.d_latent + moe.d_shared)[0]
     return resid, g
 
 
