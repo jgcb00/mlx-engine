@@ -511,6 +511,11 @@ def _attention_mask(kv_cache, L: int, window: int):
     return "causal"
 
 
+def quant_predicate(path: str, module) -> bool:
+    """Keep the router and the small per-head projections in full precision."""
+    return not path.endswith(("moe_gate", "in_proj_small"))
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -572,11 +577,7 @@ class Model(nn.Module):
 
     @property
     def quant_predicate(self):
-        def predicate(path, module):
-            # keep the router and the small per-head projections in full precision
-            return not path.endswith(("moe_gate", "in_proj_small"))
-
-        return predicate
+        return quant_predicate
 
     @property
     def cast_predicate(self):

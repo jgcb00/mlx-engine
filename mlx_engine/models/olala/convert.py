@@ -1,16 +1,36 @@
-"""Convert an Olala HF checkpoint to MLX (optionally quantized).
+"""Convert an Olala HF checkpoint to MLX.
 
-    python -m mlx_engine.models.olala.convert --hf-path <dir> --mlx-path <out> [-q --q-bits 8]
+    python -m mlx_engine.models.olala.convert --hf-path <dir> --mlx-path <out> --recipe q6
 
-Same options as ``mlx_lm.convert``; the model is registered first so that mlx-lm
-can build it. Projections are merged at load time (Model.sanitize) and saved merged.
+Recipes (KLD vs the llama.cpp bf16 reference on wikitext, 2 x 512 tokens):
+    bf16   no quantization                                       (0.004 with bf16 activations)
+    q8     8-bit, group 64                                        0.006, 6.8 GiB
+    q6     6-bit, group 64                                        0.019, 5.2 GiB
+    q5e6   routed experts 5-bit, everything else 6-bit            0.021, 4.5 GiB
+    q4e8   routed experts 4-bit / group 32, everything else 8-bit 0.030, 4.5 GiB
+    q4     4-bit, group 64 (large quality loss on this model)     0.12+
+The router and the small per-head projections are never quantized. Projections
+are merged at load time (Model.sanitize) and saved merged.
 """
 
+import argparse
 import json
-import sys
 from pathlib import Path
 
 from mlx_engine.models.olala import register
+
+
+def _is_expert(path: str) -> bool:
+    return path.endswith((".experts.experts", ".experts.output_experts"))
+
+
+RECIPES = {
+    "q8": lambda p: (8, 64),
+    "q6": lambda p: (6, 64),
+    "q5e6": lambda p: (5, 64) if _is_expert(p) else (6, 64),
+    "q4e8": lambda p: (4, 32) if _is_expert(p) else (8, 64),
+    "q4": lambda p: (4, 64),
+}
 
 
 def _clean(mlx_path: Path):
@@ -25,12 +45,39 @@ def _clean(mlx_path: Path):
 
 
 def main():
-    register()
-    from mlx_lm.convert import main as mlx_lm_convert_main
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--hf-path", required=True)
+    parser.add_argument("--mlx-path", required=True)
+    parser.add_argument("--recipe", choices=["bf16", *RECIPES], default="bf16")
+    args = parser.parse_args()
 
-    mlx_lm_convert_main()
-    if "--mlx-path" in sys.argv:
-        _clean(Path(sys.argv[sys.argv.index("--mlx-path") + 1]))
+    register()
+    from mlx_lm.convert import convert
+
+    if args.recipe == "bf16":
+        convert(args.hf_path, args.mlx_path, dtype="bfloat16")
+    else:
+        from mlx_engine.models.olala.model import quant_predicate
+
+        recipe = RECIPES[args.recipe]
+
+        def predicate(path, module):
+            if not hasattr(module, "to_quantized") or not quant_predicate(path, module):
+                return False
+            bits, group_size = recipe(path)
+            return {"bits": bits, "group_size": group_size, "mode": "affine"}
+
+        bits, group_size = recipe("")
+        convert(
+            args.hf_path,
+            args.mlx_path,
+            quantize=True,
+            q_bits=bits,
+            q_group_size=group_size,
+            dtype="bfloat16",
+            quant_predicate=predicate,
+        )
+    _clean(Path(args.mlx_path))
 
 
 if __name__ == "__main__":

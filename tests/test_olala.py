@@ -164,7 +164,7 @@ def test_registered_for_mlx_lm_and_mlx_vlm():
 
 
 @pytest.mark.skipif(os.environ.get("OLALA_TEST_QUANT") == "0", reason="disabled")
-@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("bits", [8, 6, 5, 4])
 def test_fused_decode_quantized(monkeypatch, bits):
     monkeypatch.setattr(olala_model, "_ACT_F32", True)
     import mlx.nn as nn

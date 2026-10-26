@@ -70,7 +70,7 @@ class W:
                 raise ValueError("unsupported quantization mode")
         if self.scales is not None:
             self.fmt = f"q{self.bits}"
-            if self.bits not in (4, 8) or self.gs not in (32, 64, 128):
+            if self.bits not in (4, 5, 6, 8) or self.gs not in (32, 64, 128):
                 raise ValueError("unsupported quantization")
             self.rows = self.w.shape[-2]
             self.cols = self.w.shape[-1] * 32 // self.bits
@@ -104,7 +104,22 @@ def _wtype(fmt):
 
 def _chunk(fmt):
     # values per 16-byte load
-    return {"bf16": 8, "f16": 8, "f32": 4, "q8": 16, "q4": 16}[fmt]
+    return {"bf16": 8, "f16": 8, "f32": 4, "q8": 16, "q4": 16, "q6": 16, "q5": 32}[fmt]
+
+
+def _unpack_code(bits, n):
+    """Code turning the n * bits / 32 words wq[] of a little-endian bit stream (MLX's 5 / 6 bit
+    packing) into float4 f[n / 4]."""
+    mask = (1 << bits) - 1
+    vals = []
+    for i in range(n):
+        st = bits * i
+        w, off = divmod(st, 32)
+        if off + bits <= 32:
+            vals.append(f"((wq[{w}] >> {off}) & {mask}u)")
+        else:
+            vals.append(f"(((wq[{w}] >> {off}) | (wq[{w + 1}] << {32 - off})) & {mask}u)")
+    return "\n".join(f"f[{j}] = float4({vals[4 * j]}, {vals[4 * j + 1]}, {vals[4 * j + 2]}, {vals[4 * j + 3]});" for j in range(n // 4))
 
 
 def _dot_code(fmt, name, K, gs, xexpr, tdim, rowvar, kvar):
@@ -133,6 +148,25 @@ def _dot_code(fmt, name, K, gs, xexpr, tdim, rowvar, kvar):
             return "\n".join(lines)
         lines.append(f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0, s2 = 0;")
         lines.append(f"  for (int j = 0; j < 4; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}")
+        lines.append("  acc[r][t] += sc * s1 + bi * s2; }")
+    elif fmt in ("q5", "q6"):
+        bits = int(fmt[1])
+        n = _chunk(fmt)
+        nw = n * bits // 32
+        lines.append(f"const device uint* qp = (const device uint*)({name}) + (size_t){rowvar} * ({K} * {bits} / 32) + {kvar} * {bits} / 32;")
+        lines.append(f"uint wq[{nw}]; for (int i = 0; i < {nw}; ++i) wq[i] = qp[i];")
+        lines.append(f"const size_t gi = (size_t){rowvar} * ({K} / {gs}) + {kvar} / {gs};")
+        lines.append(f"const float sc = float({name}_s[gi]), bi = float({name}_b[gi]);")
+        lines.append(f"float4 f[{n // 4}];")
+        lines.append(_unpack_code(bits, n))
+        if tdim > 1:
+            lines.append(f"for (int j = 0; j < {n // 4}; ++j) f[j] = f[j] * sc + bi;")
+            lines.append(f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0;")
+            lines.append(f"  for (int j = 0; j < {n // 4}; ++j) s1 += dot(f[j], {xexpr('t', 'j')});")
+            lines.append("  acc[r][t] += s1; }")
+            return "\n".join(lines)
+        lines.append(f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0, s2 = 0;")
+        lines.append(f"  for (int j = 0; j < {n // 4}; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}")
         lines.append("  acc[r][t] += sc * s1 + bi * s2; }")
     elif fmt == "q4":
         # 16 values per 8-byte load: 3 balanced chunks per lane at K = 1536
@@ -378,7 +412,7 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
     }[prologue]()
 
     total = sum(s[2] for s in segs)
-    if RPS == 1 and os.environ.get("OLALA_PRELOAD", "0") == "1":
+    if RPS == 1 and os.environ.get("OLALA_PRELOAD", "0") == "1" and not any(f in ("q5", "q6") for f in fmts):
         return _gemv_kernel_preload(key, K, T, segs, inputs, outputs, decl, pro, xexpr, total, step)
     body = []
     off = 0
