@@ -33,7 +33,8 @@ from typing import Any
 import mlx.core as mx
 from mlx import nn
 from mlx_lm.models.base import BaseModelArgs
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import ArraysCache
+from mlx_lm.models.cache import KVCache as _MlxKVCache
 from mlx_lm.models.switch_layers import SwitchLinear
 
 from . import kernels
@@ -89,6 +90,63 @@ class ModelArgs(BaseModelArgs):
             raise ValueError("Olala: layers_config does not match num_hidden_layers")
         if not (self.token_shift_attn and self.qk_norm and self.gate_attn and self.scalable_softmax):
             raise ValueError("Olala: only the released attention configuration is supported")
+
+
+class KVCache(_MlxKVCache):
+    """mlx-lm KVCache that the fused decode path may append to in place.
+
+    mlx-lm appends with a slice update; while the previous token's command buffer is
+    in flight MLX keeps a reference to the buffer, so every append copies the whole
+    cache (measured 0.85 ms / token at 8k context for the 7 attention layers).
+
+    In-place writes are only allowed at positions no one else can see: positions at
+    or above the high-water mark ``_hw`` of everything ever exposed (returned views,
+    ``state``). Snapshots read only below their own offset (<= _hw). Copies
+    (``copy`` / ``deepcopy`` share the MLX buffer) and restored states disable
+    in-place appends until the next regular append has given the cache its own
+    buffer (copy-on-write)."""
+
+    def __init__(self):
+        super().__init__()
+        self._hw = 0
+
+    def update_and_fetch(self, keys, values):
+        out = super().update_and_fetch(keys, values)
+        self._hw = self.offset
+        return out
+
+    @property
+    def state(self):
+        return super().state
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.offset = v
+        self._hw = self.keys.shape[2] if self.keys is not None else 0
+
+    def __copy__(self):
+        return self._shared_copy()
+
+    def __deepcopy__(self, memo):
+        return self._shared_copy()
+
+    def _shared_copy(self):
+        c = KVCache()
+        c.keys, c.values, c.offset = self.keys, self.values, self.offset
+        if self.keys is not None:
+            self._hw = c._hw = self.keys.shape[2]
+        return c
+
+    def can_append_inplace(self, n: int = 1) -> bool:
+        return (
+            self.keys is not None
+            and self.offset >= self._hw
+            and self.offset + n <= self.keys.shape[2]
+        )
+
+    def commit_inplace(self, n: int = 1):
+        self.offset += n
+        self._hw = self.offset
 
 
 def _zc(weight: mx.array, zero_centered: bool) -> mx.array:
@@ -496,8 +554,14 @@ class Model(nn.Module):
 
     @property
     def cast_predicate(self):
+        big = (
+            "in_proj.weight", "in_proj_small.weight", "mixer_proj.weight", "in_cat.weight", "out_cat.weight",
+            "experts.weight", "output_experts.weight", "embedding.weight", "lm_head.weight",
+        )
+
         def predicate(path: str):
-            # router weights and per-head parameters stay in f32 (as in the checkpoint)
-            return not (path.endswith("moe_gate.weight") or ".mixer." in path and "proj" not in path)
+            # only the large matrices follow --dtype; the router, the per-head parameters and
+            # the geodesic scalars keep the checkpoint's f32
+            return path.endswith(big)
 
         return predicate

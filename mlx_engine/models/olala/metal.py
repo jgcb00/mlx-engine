@@ -978,14 +978,24 @@ def moe_down(h, inds, we: W, top_k, T, RPS=2):
 # --------------------------------------------------------------------------
 
 
-def v_prep(big, small, kprev, vprev, prm, pos, Hq, Hk, Dh, Rk, n_noise, window, T, kv_dtype):
+def v_prep(big, small, kprev, vprev, prm, pos, Hq, Hk, Dh, Rk, n_noise, window, T, kv_dtype, kbuf=None, vbuf=None,
+           wpos=None):
     """Returns q (T,Hq,Dh) f32 (normed, scalable-softmax scaled), k / v (T,Hk,1,Dh) kv_dtype,
-    raw k / v (T,1,Hk,Dh) f32 for the next token shift."""
-    key = ("v_prep", T, Hq, Hk, Dh, Rk, str(kv_dtype))
+    raw k / v (T,1,Hk,Dh) f32 for the next token shift.
+    With kbuf / vbuf (full cache buffers (B,Hk,cap,Dh)) the new k / v are written in place at
+    position wpos[t] instead (see model.KVCache) and k / v are not returned."""
+    inplace = kbuf is not None
+    key = ("v_prep", T, Hq, Hk, Dh, Rk, str(kv_dtype), inplace)
     if key not in _kernels:
         ot = {mx.bfloat16: "bfloat", mx.float16: "half", mx.float32: "float"}[kv_dtype]
         nbig = Hq * Dh + 2 * Rk * Dh + (Hq - Hk) * Dh
         nsmall = 2 * Hk * Rk + 2 * Hk + n_noise
+        if inplace:
+            kdst = f"((device {ot}*)kbuf)[(((size_t)t * Hk + h) * kbuf_shape[2] + wpos[t]) * Dh + tid]"
+            vdst = f"((device {ot}*)vbuf)[(((size_t)t * Hk + h) * vbuf_shape[2] + wpos[t]) * Dh + tid]"
+        else:
+            kdst = "k_out[((size_t)t * Hk + h) * Dh + tid]"
+            vdst = "v_out[((size_t)t * Hk + h) * Dh + tid]"
         src = f"""
         constexpr int Hq = {Hq}, Hk = {Hk}, Dh = {Dh}, Rk = {Rk};
         constexpr int NB = {nbig}, NSM = {nsmall};
@@ -1019,7 +1029,7 @@ def v_prep(big, small, kprev, vprev, prm, pos, Hq, Hk, Dh, Rk, n_noise, window, 
             kraw_out[((size_t)t * Hk + h) * Dh + tid] = kr;
             vraw_out[((size_t)t * Hk + h) * Dh + tid] = vr;
             val = ak * kp + (1 - ak) * kr;
-            v_out[((size_t)t * Hk + h) * Dh + tid] = ({ot})(av * vp + (1 - av) * vr);
+            {vdst} = ({ot})(av * vp + (1 - av) * vr);
         }}
         float s = simd_sum(val * val);
         if (lane == 0) red[sg] = s;
@@ -1032,17 +1042,28 @@ def v_prep(big, small, kprev, vprev, prm, pos, Hq, Hk, Dh, Rk, n_noise, window, 
             q_out[((size_t)t * Hq + hh) * Dh + tid] = val * rn * qn[tid] * scaler[hh] * lp;
         }} else {{
             const int h = hh - Hq;
-            k_out[((size_t)t * Hk + h) * Dh + tid] = ({ot})(val * rn * kn[tid]);
+            {kdst} = ({ot})(val * rn * kn[tid]);
         }}
         """
+        inputs = ["big", "small", "kprev", "vprev", "qn", "kn", "scaler", "pos"]
+        outputs = ["q_out", "kraw_out", "vraw_out"] if inplace else ["q_out", "k_out", "v_out", "kraw_out", "vraw_out"]
+        if inplace:
+            inputs += ["kbuf", "vbuf", "wpos"]
         _kernels[key] = mx.fast.metal_kernel(
             name=f"olala_v_prep_{abs(hash(key)) % 10**12}",
-            input_names=["big", "small", "kprev", "vprev", "qn", "kn", "scaler", "pos"],
-            output_names=["q_out", "k_out", "v_out", "kraw_out", "vraw_out"],
-            source=src, header=_HDR,
+            input_names=inputs, output_names=outputs, source=src, header=_HDR,
+        )
+    ins = [big, small, kprev, vprev, prm["q_norm"], prm["k_norm"], prm["scaler"], pos]
+    if inplace:
+        return _kernels[key](
+            inputs=ins + [kbuf, vbuf, wpos],
+            grid=(Dh if _tiny("v_prep") else T * (Hq + Hk) * Dh, 1, 1),
+            threadgroup=(Dh, 1, 1),
+            output_shapes=[(T, Hq, Dh), (T, 1, Hk, Dh), (T, 1, Hk, Dh)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
         )
     return _kernels[key](
-        inputs=[big, small, kprev, vprev, prm["q_norm"], prm["k_norm"], prm["scaler"], pos],
+        inputs=ins,
         grid=(Dh if _tiny("v_prep") else T * (Hq + Hk) * Dh, 1, 1),
         threadgroup=(Dh, 1, 1),
         output_shapes=[(T, Hq, Dh), (T, Hk, 1, Dh), (T, Hk, 1, Dh), (T, 1, Hk, Dh), (T, 1, Hk, Dh)],
@@ -1050,105 +1071,119 @@ def v_prep(big, small, kprev, vprev, prm, pos, Hq, Hk, Dh, Rk, n_noise, window, 
     )
 
 
-ATT_BLK = 256  # keys per threadgroup split
+ATT_NW = int(os.environ.get("OLALA_ATT_NW", "4"))  # simdgroups per attention threadgroup
+_ATT_ADAPT = os.environ.get("OLALA_ATT_ADAPT", "0") == "1"
 
 
-def attn_decode(q, keys, values, kstart, scale, softcap, T, Hq, Hk, Dh):
+def _att_blk(S, Hk, T):
+    """Keys per threadgroup: enough splits to occupy the GPU at long context."""
+    blk = int(os.environ.get("OLALA_ATT_BLK", "256"))
+    while _ATT_ADAPT and blk > 64 and T * Hk * ((S + blk - 1) // blk) < 320:
+        blk //= 2
+    return blk
+
+
+def attn_decode(q, keys, values, kstart, scale, softcap, T, Hq, Hk, Dh, S=None, slen=None):
     """q (T,Hq,Dh) f32; keys / values (B,Hk,S,Dh) (possibly strided views).
-    Valid keys of row t: [kstart[t], S). Returns partial o (T,Hq,NS,Dh), m, l (T,Hq,NS)."""
-    S = keys.shape[2]
-    NS = (S + ATT_BLK - 1) // ATT_BLK
+    Valid keys of row t: [kstart[t], S). Returns partial o (T,Hq,NS,Dh), m, l (T,Hq,NS).
+
+    One threadgroup per (row, kv head, block of keys); each simdgroup walks keys of the block,
+    lane = 4 consecutive dims, so a key / value row is one coalesced load; the G query heads
+    sharing the kv head are processed together."""
+    S = S or keys.shape[2]
+    if slen is None:
+        slen = mx.array([S], dtype=mx.int32)
+    BLK = _att_blk(S, Hk, T)
+    NS = (S + BLK - 1) // BLK
     G = Hq // Hk
-    key = ("attn", Hq, Hk, Dh, str(keys.dtype))
+    assert Dh == 128
+    key = ("attn3", Hq, Hk, Dh, str(keys.dtype), BLK)
     if key not in _kernels:
+        vt = {"bfloat16": "bfloat4", "float16": "half4", "float32": "float4"}[str(keys.dtype).split(".")[-1]]
         src = f"""
-        constexpr int Hq = {Hq}, Hk = {Hk}, Dh = {Dh}, G = {G}, BLK = {ATT_BLK}, NW = 4;
+        constexpr int Hq = {Hq}, Hk = {Hk}, Dh = {Dh}, G = {G}, BLK = {BLK}, NW = {ATT_NW};
         const uint tid = thread_position_in_threadgroup.x;
         const uint sg = tid / 32, lane = tid % 32;
         const uint blk = threadgroup_position_in_grid.x;
-        const int S = keys_shape[2];
+        const int S = slen[0];
         const int NS = (S + BLK - 1) / BLK;
         const int t = blk / (Hk * NS);
         const int hk = (blk / NS) % Hk;
         const int sp = blk % NS;
         const int j0 = max(sp * BLK, kstart[t]);
         const int j1 = min((sp + 1) * BLK, S);
-        threadgroup float qs[G][Dh];
+        threadgroup float4 qs[G][Dh / 4];
         threadgroup float mo[NW][G];
         threadgroup float lo[NW][G];
-        threadgroup float oo[NW][G][Dh];
-        for (int i = tid; i < G * Dh; i += NW * 32) qs[i / Dh][i % Dh] = q[((size_t)t * Hq + hk * G + i / Dh) * Dh + i % Dh];
+        threadgroup float4 oo[NW][G][Dh / 4];
+        for (int i = tid; i < G * Dh / 4; i += NW * 32)
+            qs[i / (Dh / 4)][i % (Dh / 4)] = ((const device float4*)(q + ((size_t)t * Hq + hk * G) * Dh))[i] * {scale}f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const size_t kb = (size_t)t * keys_strides[0] + (size_t)hk * keys_strides[1];
-        const size_t vb = (size_t)t * values_strides[0] + (size_t)hk * values_strides[1];
-        float m[G], l[G], o[G][Dh / 32];
-        for (int g = 0; g < G; ++g) {{ m[g] = -INFINITY; l[g] = 0; for (int d = 0; d < Dh / 32; ++d) o[g][d] = 0; }}
-        // simdgroup sg handles keys j0 + sg*32 + lane, stepping by NW*32
+        const device {vt}* kb = (const device {vt}*)(keys + (size_t)t * keys_strides[0] + (size_t)hk * keys_strides[1]);
+        const device {vt}* vb = (const device {vt}*)(values + (size_t)t * values_strides[0] + (size_t)hk * values_strides[1]);
+        const size_t ks4 = keys_strides[2] / 4, vs4 = values_strides[2] / 4;
+        float m[G], l[G];
+        float4 o[G];
+        for (int g = 0; g < G; ++g) {{ m[g] = -INFINITY; l[g] = 0; o[g] = 0; }}
+        // simdgroup sg takes chunks of 32 keys: scores with lane = key, values with lane = 4 dims
         for (int jb = j0 + sg * 32; jb < j1; jb += NW * 32) {{
             const int j = jb + lane;
             float sc[G];
             if (j < j1) {{
-                const device auto* kr = keys + kb + (size_t)j * keys_strides[2];
+                const device {vt}* kr = kb + (size_t)j * ks4;
                 for (int g = 0; g < G; ++g) sc[g] = 0;
-                for (int d = 0; d < Dh; d += 4) {{
-                    const float4 kv = float4(kr[d], kr[d + 1], kr[d + 2], kr[d + 3]);
-                    for (int g = 0; g < G; ++g) sc[g] += dot(kv, *(threadgroup float4*)&qs[g][d]);
+                for (int d4 = 0; d4 < Dh / 4; ++d4) {{
+                    const float4 kv = float4(kr[d4]);
+                    for (int g = 0; g < G; ++g) sc[g] += dot(kv, qs[g][d4]);
                 }}
-                for (int g = 0; g < G; ++g) sc[g] = tanh(sc[g] * {scale}f / {softcap}f) * {softcap}f;
+                for (int g = 0; g < G; ++g) sc[g] = tanh(sc[g] / {softcap}f) * {softcap}f;
             }} else {{
                 for (int g = 0; g < G; ++g) sc[g] = -INFINITY;
             }}
             float pj[G];
             for (int g = 0; g < G; ++g) {{
-                const float bm = simd_max(sc[g]);
-                const float mn = max(m[g], bm);
-                const float corr = (m[g] == -INFINITY) ? 0.0f : exp(m[g] - mn);
-                pj[g] = (sc[g] == -INFINITY) ? 0.0f : exp(sc[g] - mn);
+                const float mn = max(m[g], simd_max(sc[g]));
+                const float corr = exp(m[g] - mn);
+                pj[g] = exp(sc[g] - mn);
                 l[g] = l[g] * corr + simd_sum(pj[g]);
-                for (int d = 0; d < Dh / 32; ++d) o[g][d] *= corr;
+                o[g] *= corr;
                 m[g] = mn;
             }}
             const int nk = min(32, j1 - jb);
             for (int u = 0; u < nk; ++u) {{
-                const device auto* vr = values + vb + (size_t)(jb + u) * values_strides[2];
-                float vv[Dh / 32];
-                for (int d = 0; d < Dh / 32; ++d) vv[d] = float(vr[lane + 32 * d]);
-                for (int g = 0; g < G; ++g) {{
-                    const float pu = simd_shuffle(pj[g], u);
-                    for (int d = 0; d < Dh / 32; ++d) o[g][d] += pu * vv[d];
-                }}
+                const float4 vv = float4(vb[(size_t)(jb + u) * vs4 + lane]);
+                for (int g = 0; g < G; ++g) o[g] += simd_shuffle(pj[g], u) * vv;
             }}
         }}
         for (int g = 0; g < G; ++g) {{
             if (lane == 0) {{ mo[sg][g] = m[g]; lo[sg][g] = l[g]; }}
-            for (int d = 0; d < Dh / 32; ++d) oo[sg][g][lane + 32 * d] = o[g][d];
+            oo[sg][g][lane] = o[g];
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // combine the NW simdgroups
-        for (int i = tid; i < G * Dh; i += NW * 32) {{
-            const int g = i / Dh, d = i % Dh;
+        if (sg < G) {{
+            const int g = sg;
             float M = -INFINITY;
             for (int w = 0; w < NW; ++w) M = max(M, mo[w][g]);
-            float L = 0, O = 0;
+            float L = 0; float4 O = 0;
             for (int w = 0; w < NW; ++w) {{
                 const float c = (mo[w][g] == -INFINITY) ? 0.0f : exp(mo[w][g] - M);
-                L += lo[w][g] * c; O += oo[w][g][d] * c;
+                L += lo[w][g] * c; O += oo[w][g][lane] * c;
             }}
             const size_t oi = ((size_t)t * Hq + hk * G + g) * NS + sp;
-            o_out[oi * Dh + d] = O;
-            if (d == 0) {{ m_out[oi] = M; l_out[oi] = L; }}
+            ((device float4*)(o_out + oi * Dh))[lane] = O;
+            if (lane == 0) {{ m_out[oi] = M; l_out[oi] = L; }}
         }}
         """
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"olala_attn_{abs(hash(key)) % 10**12}",
-            input_names=["q", "keys", "values", "kstart"],
+            name=f"olala_attn2_{abs(hash(key)) % 10**12}",
+            input_names=["q", "keys", "values", "kstart", "slen"],
             output_names=["o_out", "m_out", "l_out"],
             source=src, header=_HDR, ensure_row_contiguous=False,
         )
     return _kernels[key](
-        inputs=[q, keys, values, kstart],
-        grid=(128 if _tiny("attn") else T * Hk * NS * 128, 1, 1),
-        threadgroup=(128, 1, 1),
+        inputs=[q, keys, values, kstart, slen],
+        grid=(ATT_NW * 32 if _tiny("attn") else T * Hk * NS * ATT_NW * 32, 1, 1),
+        threadgroup=(ATT_NW * 32, 1, 1),
         output_shapes=[(T, Hq, NS, Dh), (T, Hq, NS), (T, Hq, NS)],
         output_dtypes=[mx.float32] * 3,
     )
@@ -1355,6 +1390,7 @@ def _m_layer(L, prev_li, T, D, first):
 
 
 _MOE_SPLIT = os.environ.get("OLALA_MOE_SPLIT", "0") == "1"
+_INPLACE_KV = os.environ.get("OLALA_INPLACE_KV", "1") == "1"
 _compiled = {}
 _COMPILE = os.environ.get("OLALA_COMPILE", "1") == "1" and not (_SKIP or _STUB)
 
@@ -1370,6 +1406,7 @@ def decode(model, x, cache, positions):
     pos = positions.reshape(T).astype(mx.int32)
 
     kstart = None  # first valid key per row (same for every attention layer)
+    wpos_cache = None
     resid = xin  # residual stream (T, D) f32 (embedding before the first layer)
     g = None  # pending update for the geodesic of the previous sub-layer
     prev_geo, prev_li = None, 0
@@ -1406,17 +1443,29 @@ def decode(model, x, cache, positions):
                 vprev = kprev
             else:
                 kprev, vprev = sc[0].astype(mx.float32), sc[1].astype(mx.float32)
-            q, k_new, v_new, kraw, vraw = v_prep(
-                big, small, kprev, vprev, L["prm"], pos, Hq, Hk, Dh, Rk, att.n_noise, att.window, T, kv_dtype
-            )
-            sc[0], sc[1] = kraw, vraw
-            keys, values = kc.update_and_fetch(k_new, v_new)
-            if kstart is None:
+            if _INPLACE_KV and hasattr(kc, "can_append_inplace") and kc.can_append_inplace(1):
+                if wpos_cache is None or wpos_cache[0] != kc.offset:
+                    wpos_cache = (kc.offset, mx.full((T,), kc.offset, dtype=mx.int32))
+                wpos = wpos_cache[1]
+                q, kraw, vraw = v_prep(
+                    big, small, kprev, vprev, L["prm"], pos, Hq, Hk, Dh, Rk, att.n_noise, att.window, T, kv_dtype,
+                    kbuf=kc.keys, vbuf=kc.values, wpos=wpos,
+                )
+                kc.commit_inplace(1)
+                keys, values, S_len = kc.keys, kc.values, kc.offset
+            else:
+                q, k_new, v_new, kraw, vraw = v_prep(
+                    big, small, kprev, vprev, L["prm"], pos, Hq, Hk, Dh, Rk, att.n_noise, att.window, T, kv_dtype
+                )
+                keys, values = kc.update_and_fetch(k_new, v_new)
                 S_len = keys.shape[2]
+            sc[0], sc[1] = kraw, vraw
+            if kstart is None:
                 lp = getattr(kc, "left_padding", None)
                 ks = max(S_len - 1 - att.window, 0)
                 kstart = (mx.maximum(lp, ks) if lp is not None else mx.full((T,), ks)).astype(mx.int32)
-            o, m, l = attn_decode(q, keys, values, kstart, att.scale, att.softcap, T, Hq, Hk, Dh)
+                slen = mx.array([S_len], dtype=mx.int32)
+            o, m, l = attn_decode(q, keys, values, kstart, att.scale, att.softcap, T, Hq, Hk, Dh, S=S_len, slen=slen)
             ymix = attn_combine(
                 o, m, l, small, big, Hq, Hk, Dh, att.snr, att.n_noise, att.gate_bias, T,
                 small_off=2 * Hk * Rk + 2 * Hk, big_off=Hq * Dh + 2 * Rk * Dh,

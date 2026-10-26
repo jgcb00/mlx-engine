@@ -264,16 +264,38 @@ def _mamba3_chunked_ref(proj, dyn, state, m, mask, lengths):
 # --------------------------------------------------------------------------
 
 
+ATTN_SCORE_BUDGET = 512 * 1024 * 1024  # bytes of f32 scores materialized at once
+
+
 def softcap_attention(q, k, v, scale, softcap, mask):
-    """q: (B,Hq,L,D), k/v: (B,Hk,T,D). mask: None, "causal" or bool array broadcastable to (B,1,L,T)."""
+    """q: (B,Hq,L,D), k/v: (B,Hk,T,D). mask: None, "causal" or bool array broadcastable to (B,1,L,T).
+    Queries are processed in chunks so that the f32 score matrix stays under ATTN_SCORE_BUDGET."""
+    B, Hq, L, D = q.shape
+    T = k.shape[2]
+    qc = max(1, ATTN_SCORE_BUDGET // (4 * B * Hq * T))
+    if qc >= L:
+        return _softcap_attention_chunk(q, k, v, scale, softcap, mask, 0)
+    outs = []
+    for s0 in range(0, L, qc):
+        s1 = min(L, s0 + qc)
+        m = mask
+        if m is not None and not isinstance(m, str):
+            m = m[..., s0:s1, :] if m.shape[-2] == L else m
+        outs.append(_softcap_attention_chunk(q[:, :, s0:s1], k, v, scale, softcap, m, s0, L))
+        mx.eval(outs[-1])
+    return mx.concatenate(outs, axis=2)
+
+
+def _softcap_attention_chunk(q, k, v, scale, softcap, mask, q0, L_total=None):
     B, Hq, L, D = q.shape
     Hk, T = k.shape[1], k.shape[2]
+    L_total = L_total or L
     G = Hq // Hk
     qg = q.reshape(B, Hk, G, L, D)
     s = (qg @ k[:, :, None].swapaxes(-1, -2)).astype(mx.float32) * scale  # (B,Hk,G,L,T)
     s = mx.tanh(s / softcap) * softcap
     if isinstance(mask, str):
-        qi = mx.arange(T - L, T)[:, None]
+        qi = mx.arange(T - L_total + q0, T - L_total + q0 + L)[:, None]
         ki = mx.arange(T)[None]
         s = mx.where(ki <= qi, s, -mx.inf)
     elif mask is not None:
