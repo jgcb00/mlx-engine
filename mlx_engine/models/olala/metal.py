@@ -19,7 +19,16 @@ import os
 import mlx.core as mx
 from mlx import nn
 
-MAX_ROWS = 8
+MAX_ROWS = int(os.environ.get("OLALA_MAX_ROWS", "128"))  # fused decode up to this batch size
+GEMV_MAX_T = int(os.environ.get("OLALA_GEMV_MAX_T", "8"))  # bf16 / f16 weights: above this many rows
+GEMV_MAX_TQ = int(os.environ.get("OLALA_GEMV_MAX_TQ", "5"))  # quantized weights: above this many rows
+
+
+def _gemv_limit(ws):
+    return GEMV_MAX_TQ if any(w.scales is not None for w in ws) else GEMV_MAX_T
+
+
+# above the limit, matrix products use MLX's (q)matmul instead of the GEMV kernels
 NSG = int(os.environ.get("OLALA_NSG", "16"))  # simdgroups per threadgroup in the GEMV kernels
 TG_X_BYTES = 28 * 1024  # threadgroup memory budget for a computed GEMV input
 
@@ -95,7 +104,7 @@ def _wtype(fmt):
 
 def _chunk(fmt):
     # values per 16-byte load
-    return {"bf16": 8, "f16": 8, "f32": 4, "q8": 16, "q4": 32}[fmt]
+    return {"bf16": 8, "f16": 8, "f32": 4, "q8": 16, "q4": 16}[fmt]
 
 
 def _dot_code(fmt, name, K, gs, xexpr, tdim, rowvar, kvar):
@@ -116,22 +125,34 @@ def _dot_code(fmt, name, K, gs, xexpr, tdim, rowvar, kvar):
         lines.append(f"const float sc = float({name}_s[gi]), bi = float({name}_b[gi]);")
         lines.append("float4 f[4];")
         lines.append("for (int j = 0; j < 4; ++j) { const uint u = q[j]; f[j] = float4(u & 0xffu, (u >> 8) & 0xffu, (u >> 16) & 0xffu, u >> 24); }")
+        if tdim > 1:  # several tokens share the chunk: dequantize once, then plain dot products
+            lines.append("for (int j = 0; j < 4; ++j) f[j] = f[j] * sc + bi;")
+            lines.append(f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0;")
+            lines.append(f"  for (int j = 0; j < 4; ++j) s1 += dot(f[j], {xexpr('t', 'j')});")
+            lines.append("  acc[r][t] += s1; }")
+            return "\n".join(lines)
         lines.append(f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0, s2 = 0;")
         lines.append(f"  for (int j = 0; j < 4; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}")
         lines.append("  acc[r][t] += sc * s1 + bi * s2; }")
     elif fmt == "q4":
-        lines.append(f"const uint4 q = *(const device uint4*)({name} + (size_t){rowvar} * ({K} / 8) + {kvar} / 8);")
-        if gs >= 32:
-            lines.append(f"const size_t gi = (size_t){rowvar} * ({K} / {gs}) + {kvar} / {gs};")
-            lines.append(f"const float sc = float({name}_s[gi]), bi = float({name}_b[gi]);")
-        lines.append("float4 f[8];")
+        # 16 values per 8-byte load: 3 balanced chunks per lane at K = 1536
+        lines.append(f"const uint2 q = *(const device uint2*)({name} + (size_t){rowvar} * ({K} / 8) + {kvar} / 8);")
+        lines.append(f"const size_t gi = (size_t){rowvar} * ({K} / {gs}) + {kvar} / {gs};")
+        lines.append(f"const float sc = float({name}_s[gi]), bi = float({name}_b[gi]);")
+        lines.append("float4 f[4];")
         lines.append(
-            "for (int j = 0; j < 4; ++j) { const uint u = q[j]; "
+            "for (int j = 0; j < 2; ++j) { const uint u = q[j]; "
             "f[2*j] = float4(u & 0xfu, (u >> 4) & 0xfu, (u >> 8) & 0xfu, (u >> 12) & 0xfu); "
             "f[2*j+1] = float4((u >> 16) & 0xfu, (u >> 20) & 0xfu, (u >> 24) & 0xfu, u >> 28); }"
         )
+        if tdim > 1:
+            lines.append("for (int j = 0; j < 4; ++j) f[j] = f[j] * sc + bi;")
+            lines.append(f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0;")
+            lines.append(f"  for (int j = 0; j < 4; ++j) s1 += dot(f[j], {xexpr('t', 'j')});")
+            lines.append("  acc[r][t] += s1; }")
+            return "\n".join(lines)
         lines.append(f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0, s2 = 0;")
-        lines.append(f"  for (int j = 0; j < 8; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}")
+        lines.append(f"  for (int j = 0; j < 4; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}")
         lines.append("  acc[r][t] += sc * s1 + bi * s2; }")
     return "\n".join(lines)
 
@@ -141,6 +162,11 @@ def _reg_load(fmt, name, K, gs):
     if fmt in ("bf16", "f16", "f32"):
         return f"wv[c] = *(const device uint4*)({name} + (size_t)lr * {K} + k);"
     div = 4 if fmt == "q8" else 8
+    if fmt == "q4":
+        return (
+            f"wv[c] = uint4(*(const device uint2*)({name} + (size_t)lr * ({K} / 8) + k / 8), 0, 0); "
+            f"sbv[c] = float2({name}_s[(size_t)lr * ({K} / {gs}) + k / {gs}], {name}_b[(size_t)lr * ({K} / {gs}) + k / {gs}]);"
+        )
     return (
         f"wv[c] = *(const device uint4*)({name} + (size_t)lr * ({K} / {div}) + k / {div}); "
         f"sbv[c] = float2({name}_s[(size_t)lr * ({K} / {gs}) + k / {gs}], {name}_b[(size_t)lr * ({K} / {gs}) + k / {gs}]);"
@@ -167,12 +193,12 @@ def _reg_fma(fmt, xexpr, T):
             "  acc[t] += sbv[c].x * s1 + sbv[c].y * s2; } }"
         )
     return (
-        "{ const uint4 u = wv[c]; float4 f[8];\n"
-        "for (int j = 0; j < 4; ++j) { const uint q = u[j]; "
+        "{ const uint4 u = wv[c]; float4 f[4];\n"
+        "for (int j = 0; j < 2; ++j) { const uint q = u[j]; "
         "f[2*j] = float4(q & 0xfu, (q >> 4) & 0xfu, (q >> 8) & 0xfu, (q >> 12) & 0xfu); "
         "f[2*j+1] = float4((q >> 16) & 0xfu, (q >> 20) & 0xfu, (q >> 24) & 0xfu, q >> 28); }\n"
         f"for (int t = 0; t < {T}; ++t) {{ float s1 = 0, s2 = 0;\n"
-        f"  for (int j = 0; j < 8; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}\n"
+        f"  for (int j = 0; j < 4; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}\n"
         "  acc[t] += sbv[c].x * s1 + sbv[c].y * s2; } }"
     )
 
@@ -279,9 +305,10 @@ def _relu2cat_prologue(K, T, Ka, sa, sb):
     """
 
 
-def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=4):
-    """segs: list of (fmt, gs, rows). Output j is (T, rows_j) f32."""
-    key = ("gemv", K, T, tuple(segs), prologue, LI, Ka, sa, sb, x_in_tg, RPS)
+def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=4, ndeps=0):
+    """segs: list of (fmt, gs, rows). Output j is (T, rows_j) f32. ndeps extra (unused) inputs
+    order the kernel after the kernels that produced them."""
+    key = ("gemv", K, T, tuple(segs), prologue, LI, Ka, sa, sb, x_in_tg, RPS, ndeps)
     if key in _kernels:
         return _kernels[key]
     fmts = [s[0] for s in segs]
@@ -304,6 +331,7 @@ def gemv_kernel(K, T, segs, prologue, LI=0, Ka=0, sa=0, sb=0, x_in_tg=True, RPS=
         inputs.append(f"w{j}")
         if fmt.startswith("q"):
             inputs += [f"w{j}_s", f"w{j}_b"]
+    inputs += [f"dep{j}" for j in range(ndeps)]
     outputs = [f"y{j}" for j in range(len(segs))]
     if prologue in ("geo", "norm"):
         outputs.append("xout")
@@ -457,12 +485,45 @@ def _gemv_kernel_preload(key, K, T, segs, inputs, outputs, decl, pro, xexpr, tot
     return _kernels[key]
 
 
-def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RPS=None):
+def mlx_linear(x, w: "W"):
+    """x (T, K) f32 @ W.T with MLX kernels; f32 output. Quantized weights take f32 activations
+    directly; bf16 / f16 weights take activations in the weight dtype."""
+    if w.scales is not None:
+        return mx.quantized_matmul(x, w.w, w.scales, w.biases, transpose=True, group_size=w.gs, bits=w.bits)
+    if w.w.dtype == mx.float32:
+        return x @ w.w.T
+    return (x.astype(w.w.dtype) @ w.w.T).astype(mx.float32)
+
+
+def _gemv_mlx(x_inputs, ws, prologue, LI, Ka, sa, sb, T, K):
+    """Many rows: prologue as its own kernel / ops, products through MLX (q)matmul."""
+    extra = []
+    if prologue == "geo":
+        x = geodesic(x_inputs[0], x_inputs[1], x_inputs[2], LI, T, K)
+        extra = [x]
+    elif prologue == "norm":
+        x0 = x_inputs[0]
+        x = x0 / mx.maximum(mx.sqrt(mx.sum(x0 * x0, axis=-1, keepdims=True)), 1e-12)
+        extra = [x]
+    elif prologue == "relu2cat":
+        a, b = x_inputs
+        x = mx.concatenate([a[:, :Ka], mx.square(nn.relu(b[:, Ka:K]))], axis=-1)
+    elif prologue == "moecat":
+        parts, b = x_inputs
+        x = mx.concatenate([parts.sum(axis=1), mx.square(nn.relu(b[:, Ka:K]))], axis=-1)
+    else:
+        x = x_inputs[0]
+    return [mlx_linear(x, w) for w in ws] + extra
+
+
+def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RPS=None, deps=()):
     RPS = RPS or int(os.environ.get("OLALA_RPS", "1"))
     """Run a fused GEMV. x_inputs: list of input arrays for the prologue. ws: list of W.
     Returns [y_j (T, rows_j) f32 ...] (+ xout (T, K) for geo / norm)."""
     K = K or ws[0].cols
     segs = [(w.fmt, w.gs or 0, w.rows) for w in ws]
+    if T > _gemv_limit(ws):
+        return _gemv_mlx(x_inputs, ws, prologue, LI, Ka, sa, sb, T, K)
     if prologue in ("geo", "norm") and T * K * 4 > TG_X_BYTES:
         # too wide for threadgroup memory: run the prologue on its own, then a plain GEMV
         if prologue == "geo":
@@ -477,13 +538,14 @@ def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RP
         return gemv([e, b], ws, prologue="relu2cat", Ka=Ka, sa=Ka, sb=sb, T=T, K=K, RPS=RPS)
     x_in_tg = prologue in ("geo", "norm", "moecat") or (
         prologue == "plain" and T * K * 4 <= TG_X_BYTES and os.environ.get("OLALA_PLAIN_TG", "0") == "1")
-    kern, total, _ = gemv_kernel(K, T, segs, prologue, LI, Ka, sa, sb, x_in_tg, RPS)
+    kern, total, _ = gemv_kernel(K, T, segs, prologue, LI, Ka, sa, sb, x_in_tg, RPS, ndeps=len(deps))
     ntg = (total + NSG * RPS - 1) // (NSG * RPS)
     if _TINY and _tiny():
         ntg = 1
     inputs = list(x_inputs)
     for w in ws:
         inputs += w.arrays()
+    inputs += [d.reshape(-1)[:4] for d in deps]
     shapes = [(T, w.rows) for w in ws]
     dtypes = [mx.float32] * len(ws)
     if prologue in ("geo", "norm"):
@@ -504,21 +566,24 @@ def gemv(x_inputs, ws, prologue="plain", LI=0, Ka=0, sa=0, sb=0, T=1, K=None, RP
 
 
 def geodesic(xin, g, geo, LI, T, K):
-    key = ("geo", K, T, LI)
+    """Standalone geodesic update, one threadgroup per row."""
+    key = ("geo1", K, LI)
     if key not in _kernels:
+        body = _geo_prologue(K, 1, LI).replace("xin[t * " + str(K), "xin[row * " + str(K)).replace(
+            "g[t * " + str(K), "g[row * " + str(K)).replace("xs[t * " + str(K) + " + i] = v;", "").replace(
+            "xout[t * " + str(K), "xout[row * " + str(K)).replace("if (tgid == 0) xout", "xout")
         src = f"""
         const uint tid = thread_position_in_threadgroup.x;
         const uint sg = tid / 32, lane = tid % 32;
-        const uint tgid = threadgroup_position_in_grid.x;
-        threadgroup float xs[1];  // unused
-        device float* xs_ = xout;
-        """ + _geo_prologue(K, T, LI).replace("xs[t * " + str(K) + " + i] = v;", "")
+        const uint row = threadgroup_position_in_grid.x;
+        const uint tgid = 0;
+        """ + body
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"olala_geo_{K}_{T}_{LI}", input_names=["xin", "g", "geo"], output_names=["xout"],
+            name=f"olala_geo1_{K}_{LI}", input_names=["xin", "g", "geo"], output_names=["xout"],
             source=src, header=_HDR,
         )
     return _kernels[key](
-        inputs=[xin, g, geo], grid=(NSG * 32, 1, 1), threadgroup=(NSG * 32, 1, 1),
+        inputs=[xin, g, geo], grid=(T * NSG * 32, 1, 1), threadgroup=(NSG * 32, 1, 1),
         output_shapes=[(T, K)], output_dtypes=[mx.float32],
     )[0]
 
@@ -541,7 +606,49 @@ def m3_param_pack(m):
     return mx.concatenate([a.astype(f32).reshape(-1) for a in parts])
 
 
-def m3_step(proj, prm, st, H, P, N, R, A, n_static):
+def _m3_proj_code(wmp, K, PB):
+    """gmix[b, o] += sum_p W[o, h*P + pb*PB + p] * ys[p] for this threadgroup's rows (atomic)."""
+    ch = _chunk(wmp.fmt)
+    assert PB % ch == 0
+
+    def xexpr(t, j):
+        return f"*(const threadgroup float4*)(ys + (k - c0) + 4 * ({j}))"
+
+    dot = _dot_code(wmp.fmt, "wm", K, wmp.gs or 0, xexpr, 1, "o", "k").replace("acc[r][t]", "acc")
+    return f"""
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {{
+            device atomic<float>* gm = (device atomic<float>*)gmix_in;
+            const int c0 = h * P + pb * PB;
+            for (int o = tid; o < {wmp.rows}; o += NSGM * 32) {{
+                float acc = 0;
+                for (int k = c0; k < c0 + PB; k += {ch}) {{
+                    {dot}
+                }}
+                atomic_fetch_add_explicit(&gm[(size_t)b * {wmp.rows} + o], acc, memory_order_relaxed);
+            }}
+        }}
+    """
+
+
+def zeros_f32(shape):
+    """A materialized zero (T, D) f32 buffer (kernels accumulate into it atomically)."""
+    key = ("zeros",)
+    if key not in _kernels:
+        _kernels[key] = mx.fast.metal_kernel(
+            name="olala_zeros", input_names=["n_"], output_names=["z"],
+            source="const uint i = thread_position_in_grid.x; if (i < (uint)n_[0]) z[i] = 0.0f;",
+        )
+    n = 1
+    for d in shape:
+        n *= d
+    return _kernels[key](
+        inputs=[mx.array([n, 0, 0, 0], dtype=mx.int32)], grid=(((n + 255) // 256) * 256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[shape], output_dtypes=[mx.float32],
+    )[0]
+
+
+def m3_step(proj, prm, st, H, P, N, R, A, n_static, wmp=None, gmix=None):
     """proj: (T, n_static + n_dyn) f32 (one token per batch row); prm: m3_param_pack();
     st: packed state (T, H, P*N + R*N + P + A) f32. Returns y (T, H*P) and the new state.
 
@@ -553,7 +660,8 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static):
     SW = P * N + R * N + P + A
     PB = M3_PB
     NSG_ = 16
-    key = ("m3v2", T, H, P, N, R, A, n_static, PB)
+    fused = wmp is not None
+    key = ("m3v2", T, H, P, N, R, A, n_static, PB, wmp.key() if fused else None, wmp.rows if fused else 0)
     if key not in _kernels:
         assert N == 128 and A == 32 and 2 * R <= NSG_ and PB % NSG_ == 0
         src = f"""
@@ -644,18 +752,35 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static):
             const float4 s = alpha * srow[i] + beta * kvp + gamma * kv;
             ((device float4*)(sout + p * N))[lane] = s;
             const float acc = simd_sum(dot(s, qw));
-            if (lane == 0) y[(size_t)b * H * P + h * P + p] = acc + Dh * d;
+            if (lane == 0) {{ {"ys[pl] = acc + Dh * d;" if fused else "y[(size_t)b * H * P + h * P + p] = acc + Dh * d;"} }}
         }}
+        {_m3_proj_code(wmp, H * P, PB) if fused else ""}
         """
-        _kernels[key] = mx.fast.metal_kernel(
-            name=f"olala_m3v2_{T}_{PB}",
-            input_names=["proj", "prm", "st"],
-            output_names=["y", "st_out"],
-            source=src,
-            header=_HDR,
-        )
+        if fused:
+            src = src.replace("threadgroup float vws[3][R][PB];", "threadgroup float vws[3][R][PB];\n        threadgroup float ys[PB];")
+            names = ["proj", "prm", "st", "wm"] + (["wm_s", "wm_b"] if wmp.fmt.startswith("q") else []) + ["gmix_in"]
+            _kernels[key] = mx.fast.metal_kernel(
+                name=f"olala_m3v2f_{abs(hash(key)) % 10**12}", input_names=names, output_names=["st_out"],
+                source=src, header=_HDR,
+            )
+        else:
+            _kernels[key] = mx.fast.metal_kernel(
+                name=f"olala_m3v2_{T}_{PB}",
+                input_names=["proj", "prm", "st"],
+                output_names=["y", "st_out"],
+                source=src,
+                header=_HDR,
+            )
     kern = _kernels[key]
     npb = P // PB
+    if fused:
+        return kern(
+            inputs=[proj, prm, st] + wmp.arrays() + [gmix],
+            grid=(T * H * npb * NSG_ * 32, 1, 1),
+            threadgroup=(NSG_ * 32, 1, 1),
+            output_shapes=[(T, H, SW)],
+            output_dtypes=[mx.float32],
+        )[0]
     return kern(
         inputs=[proj, prm, st],
         grid=(NSG_ * 32 if _tiny("m3") else T * H * npb * NSG_ * 32, 1, 1),
@@ -1350,12 +1475,24 @@ def _k(name, li, fn, *args, **kw):
     return fn(*args, **kw)
 
 
-def _moe_block(L, resid, gmix, T, D):
+def _moe_block(L, resid, gmix, T, D, deps=()):
     """geodesic(resid, gmix) -> MoE. Returns (resid', g) with g the MoE output."""
     li = L["li"]
     moe = L["moe"]
     logits, hcat, resid = _k("in_cat", li, gemv, [resid, gmix, L["geo_mixer"]], [L["router"], L["in_cat"]],
-                             prologue="geo", LI=li, T=T, K=D)
+                             prologue="geo", LI=li, T=T, K=D, deps=deps)
+    if T > _gemv_limit([L["up"], L["down"]]):
+        # many rows: sorted gather (q)matmul over the selected experts
+        from . import kernels
+
+        inds, probs = kernels.moe_route(logits, L["ebias"], moe.top_k, moe.scaling)
+        x0 = hcat[:, : moe.d_latent]
+        if moe.experts.experts.weight.dtype in (mx.bfloat16, mx.float16):
+            x0 = x0.astype(moe.experts.experts.weight.dtype)
+        e = kernels.moe_experts(x0, inds, probs.astype(x0.dtype), moe.experts).astype(mx.float32)
+        g = gemv([e, hcat], [L["out_cat"]], prologue="relu2cat", Ka=moe.d_latent, sa=moe.d_latent,
+                 sb=hcat.shape[1], T=T, K=moe.d_latent + moe.d_shared)[0]
+        return resid, g
     if _MOE_SPLIT:
         hexp, inds = _k("moe_up", li, moe_up, logits, L["ebias"], hcat, hcat.shape[1], L["up"], moe.top_k, moe.scaling, T)
         e = _k("moe_down", li, moe_down, hexp, inds, L["down"], moe.top_k, T)
@@ -1384,9 +1521,16 @@ def _m_layer(L, prev_li, T, D, first):
         else:
             outs = _k("in", li, gemv, [resid, g, prev_geo], [L["in"]], prologue="geo", LI=prev_li, T=T, K=D)
         resid = outs[-1]
-        y, st = _k("m3", li, m3_step, outs[0], L["prm"]["m3"], st, H, P, N, R, A, n_static)
-        gmix = _k("mixer_proj", li, gemv, [y], [L["mixer_proj"]], T=T)[0]
-        resid, g = _moe_block(L, resid, gmix, T, D)
+        if _M3_FUSED_PROJ and T == 1:
+            gmix = zeros_f32((T, D))
+            st = _k("m3", li, m3_step, outs[0], L["prm"]["m3"], st, H, P, N, R, A, n_static, wmp=L["mixer_proj"],
+                    gmix=gmix)
+            # gmix is accumulated in place by m3_step: depend on its state output for ordering
+            resid, g = _moe_block(L, resid, gmix, T, D, deps=(st,))
+        else:
+            y, st = _k("m3", li, m3_step, outs[0], L["prm"]["m3"], st, H, P, N, R, A, n_static)
+            gmix = _k("mixer_proj", li, gemv, [y], [L["mixer_proj"]], T=T)[0]
+            resid, g = _moe_block(L, resid, gmix, T, D)
         return resid, g, st
 
     return f
@@ -1394,6 +1538,7 @@ def _m_layer(L, prev_li, T, D, first):
 
 _MOE_SPLIT = os.environ.get("OLALA_MOE_SPLIT", "0") == "1"
 _INPLACE_KV = os.environ.get("OLALA_INPLACE_KV", "1") == "1"
+_M3_FUSED_PROJ = os.environ.get("OLALA_M3_FUSED_PROJ", "1") == "1"
 _compiled = {}
 _COMPILE = os.environ.get("OLALA_COMPILE", "1") == "1" and not (_SKIP or _STUB)
 
