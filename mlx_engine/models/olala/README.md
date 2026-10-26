@@ -34,9 +34,9 @@ checkpoint does not need the HF remote code.
 
 | format | bytes / token | decode B=1 | share of 819 GB/s | B=4 total | B=64 total | prefill (8k, 2048 chunks) |
 |---|---|---|---|---|---|---|
-| bf16 | 2.58 GB | 183 tok/s | 58 % | 494 tok/s | 1816 tok/s | 2838 tok/s |
-| q8 | 1.45 GB | 246 tok/s | 43 % | 505 tok/s | 1766 tok/s | 2857 tok/s |
-| q6 | 1.14 GB | 271 tok/s | 38 % | 530 tok/s | 1739 tok/s | 2845 tok/s |
+| bf16 | 2.58 GB | 183 tok/s | 58 % | 525 tok/s | 1829 tok/s | 3684 tok/s |
+| q8 | 1.45 GB | 245 tok/s | 43 % | 502 tok/s | 1751 tok/s | 3717 tok/s |
+| q6 | 1.14 GB | 271 tok/s | 38 % | 529 tok/s | 1726 tok/s | 3710 tok/s |
 
 For reference, llama.cpp (same machine, Metal) decodes one stream at 149 tok/s
 (bf16) and 178 tok/s (q8_0-safe2). Bytes / token counts every weight read for
@@ -60,9 +60,11 @@ path (`kernels.py`, kept for prefill fallback and testing):
 
 Activations stay in f32; weights are read as bf16 / f16 / f32 or MLX affine
 4 / 5 / 6 / 8-bit. Above 8 rows (bf16) / 5 rows (quantized) the matrix products
-use MLX's (q)matmul. Prefill uses MLX matmuls, a fused sequential Mamba-3 kernel
-(`m3_prefill`), a flash-attention style kernel with soft-capping
-(`attn_prefill`) and the fused geodesic kernel.
+use MLX's (q)matmul. Prefill uses MLX matmuls, a chunked Mamba-3 kernel
+(`m3_chunked`: chunks of 4 tokens, the state stays in registers as 8x8
+simdgroup matrices, ~3x faster than the sequential `m3_prefill`), a
+flash-attention style kernel with soft-capping (`attn_prefill`) and the fused
+geodesic kernel.
 
 Things measured along the way that shape the code:
 
@@ -78,17 +80,23 @@ Things measured along the way that shape the code:
   while another thread evaluates crashed MLX).
 - The GEMV producing a residual update also accumulates the geodesic sums
   (x.x, x.g, g.g), so the next GEMV's prologue needs no reduction.
+- A factored (TPA) KV cache (the rank-4 B_k / B_v rows plus per-head
+  coefficients, 2.8 KB instead of 6.1 KB per token and layer) was prototyped for
+  decoding: exact, but the attention kernel was 1.3-2.9x slower. It needs ~4.6x
+  the multiply-adds of the full cache (all 48 heads against 4 rows per key, token
+  shift included), which at the M3 Ultra's ~7 TFMA/s (simdgroup matrices) and
+  819 GB/s is at best on par with reading the full cache.
 - Routed-expert outputs are summed with float atomics (fastest). The summation
   order then varies between runs; `OLALA_DETERMINISTIC=1` uses fixed-order partial
   sums instead (~3 % slower).
 
 Switches: `OLALA_FUSED=0` / `OLALA_FUSED_PREFILL=0` use the reference path for
-decode / prefill, `OLALA_MLX_REF=1` disables all Metal kernels, `OLALA_WARMUP=0`
-disables the background compilation.
+decode / prefill, `OLALA_M3_CHUNKED=0` the sequential Mamba-3 prefill kernel, `OLALA_MLX_REF=1` disables all Metal kernels, `OLALA_WARMUP=0`
+disables the kernel warm-up.
 
 ## Tests
 
 `tests/test_olala.py` (tiny random model, no checkpoint): fused decode against
 the reference path with f32 activations (bf16 and 8 / 6 / 5 / 4-bit), chunked
-prefill against token-by-token, cache layout, in-place KV semantics, weight
+prefill against token-by-token, chunked against sequential Mamba-3 kernel, cache layout, in-place KV semantics, weight
 merging.
