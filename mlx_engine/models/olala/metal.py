@@ -1194,6 +1194,356 @@ def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None, seg=1, write_y=
     return y, st_out, log_a
 
 
+M3C_T = 4  # tokens per chunk in m3_chunked
+M3C_PS = 1  # threadgroups per head (each owns P / M3C_PS state rows; 2 was slower)
+
+# element (row, col) of a simdgroup_float8x8 held in thread_elements()[k] is (_FM, _FN + k)
+_FRAG = """
+        const short fq_ = lane / 4;
+        const short _FM = (fq_ & 4) + ((lane / 2) % 4);
+        const short _FN = (fq_ & 2) * 2 + (lane % 2) * 2;
+"""
+
+
+def _m3c_prep(proj, prm, st, rng, H, P, N, R, A, n_static):
+    """Per-token inputs of m3_chunked that do not depend on the state, in parallel:
+    sc (B, L, H, 4) = (log alpha, gamma, delta, 0) (zero outside the valid range),
+    cs (B, L, H, 2, A) = cos / sin of the cumulative rotary angles, th (B, H, A) the final
+    angles, bc (B, L, 2R, N) the normalized B | C rows (norm weight applied, no bias).
+    Simdgroups [0, B*H) scan the angles of one head, the others normalize one row each."""
+    B, L, _PW = proj.shape
+    key = ("m3c_prep", H, P, N, R, A, n_static)
+    if key not in _kernels:
+        SW = P * N + R * N + P + A
+        src = f"""
+        constexpr int H = {H}, P = {P}, N = {N}, R = {R}, A = {A};
+        constexpr int PH = 2 * P + 3, NS = {n_static}, PW = {n_static} + 2 * R * N + A;
+        constexpr int SW = {SW}, OA = P * N + R * N + P;
+        constexpr int O_DT = 0, O_BN = 2 * H, O_CN = O_BN + N;
+        const uint lane = thread_position_in_threadgroup.x % 32;
+        const int blk = threadgroup_position_in_grid.x * 8 + thread_position_in_threadgroup.x / 32;  // simdgroup
+        const int L = proj_shape[1];
+        const int B = proj_shape[0];
+        if (blk >= B * H + B * L * 2 * R) return;
+        if (blk < B * H) {{
+            // blocks of 32 tokens, lane = token: scalars in parallel, angles by prefix sums
+            const int b = blk / H, h = blk % H;
+            const int s0 = rng[2 * b], s1 = rng[2 * b + 1];
+            const device float* pr0 = proj + (size_t)b * L * PW;
+            const float dtb = prm[O_DT + h];
+            float carry[A];
+            for (int a = 0; a < A; ++a) carry[a] = st[((size_t)b * H + h) * SW + OA + a];
+            for (int t0 = 0; t0 < L; t0 += 32) {{
+                const int t = t0 + lane, tl = min(t, L - 1);
+                const device float* prt = pr0 + (size_t)tl * PW;
+                const float3 raw = float3(prt[h * PH + 2 * P], prt[h * PH + 2 * P + 1], prt[h * PH + 2 * P + 2]);
+                float4 ang[A / 4];
+                for (int i = 0; i < A / 4; ++i) ang[i] = ((const device float4*)(prt + NS + 2 * R * N))[i];
+                const bool ok = t >= s0 && t < s1;
+                const float dt = ok ? olala_softplus(raw.x + dtb) : 0.0f;
+                const float la = min(-olala_softplus(raw.y), -1e-4f) * dt;
+                const float trap = olala_sigmoid(raw.z);
+                const size_t o = ((size_t)b * L + tl) * H + h;
+                if (t < L) ((device float4*)sc)[o] = float4(la, trap * dt, (1.0f - trap) * dt, 0.0f);
+                device float4* co = (device float4*)(cs + o * 2 * A);
+                for (int i = 0; i < A / 4; ++i) {{
+                    float4 th4;
+                    for (int k = 0; k < 4; ++k) {{
+                        const int a = 4 * i + k;
+                        const float inc = tanh(ang[i][k]) * {math.pi}f * dt;
+                        float th = carry[a] + simd_prefix_inclusive_sum(inc);
+                        th = th - {2 * math.pi}f * rint(th * {0.5 / math.pi}f);
+                        carry[a] = simd_shuffle(th, 31);
+                        th4[k] = th;
+                    }}
+                    if (t < L) {{
+                        co[i] = cos(th4);
+                        co[A / 4 + i] = sin(th4);
+                    }}
+                }}
+            }}
+            for (int a = 0; a < A; ++a) if (lane == a) th_out[((size_t)b * H + h) * A + a] = carry[a];
+        }} else {{
+            const int row = blk - B * H;              // (b, t, j) with j < 2R
+            const int j = row % (2 * R), bt = row / (2 * R);
+            const float4 u = ((const device float4*)(proj + (size_t)bt * PW + NS + j * N))[lane];
+            const float ss = simd_sum(dot(u, u));
+            const float4 wn = ((const device float4*)(prm + (j < R ? O_BN : O_CN)))[lane];
+            ((device float4*)(bc + (size_t)row * N))[lane] = u * rsqrt(ss / N + {1e-6}f) * wn;
+        }}
+        """
+        _kernels[key] = mx.fast.metal_kernel(
+            name="olala_m3c_prep",
+            input_names=["proj", "prm", "st", "rng"],
+            output_names=["sc", "cs", "th_out", "bc"],
+            source=src,
+            header=_HDR,
+        )
+    return _kernels[key](
+        inputs=[proj, prm, st, rng],
+        grid=((B * H + B * L * 2 * R + 7) // 8 * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, L, H, 4), (B, L, H, 2, A), (B, H, A), (B, L, 2 * R, N)],
+        output_dtypes=[mx.float32] * 4,
+    )
+
+
+def m3_chunked(proj, prm, st, H, P, N, R, A, n_static, rng=None):
+    """Mamba-3 MIMO over a prompt in chunks of T tokens with simdgroup matrix products.
+
+    Same interface and result as m3_prefill. Per chunk (rows (t, r) of the T*R queries / keys):
+        O^T = exp(cum) * (S q^T)                           (inter-chunk, from the state)
+            + V^T (M * (K Q^T))                            (intra-chunk, decay mask M)
+        S   = exp(cum_T) S + (e * V)^T K                   (state update)
+    where the trapezoid term of the next chunk's first token is folded into the last key's
+    weight e. Threadgroup = (row, head, P / PS state rows), P / PS / 4 simdgroups; simdgroup g
+    keeps state tiles (p block g / 2, n half g % 2) in registers for the whole prompt. The
+    per-token inputs that do not depend on the state come from _m3c_prep. ~3x faster than
+    m3_prefill at 2k tokens (limited by the simdgroup matrix throughput)."""
+    B, L, _PW = proj.shape
+    SW = P * N + R * N + P + A
+    T, PS = M3C_T, M3C_PS
+    TR, PL = T * R, P // PS
+    NSG_ = PL // 4  # simdgroup g owns state tiles (p block g / 2, n half g % 2)
+    NT = NSG_ * 32
+    RB = 2 * TR // NSG_  # K / Q rows built per simdgroup
+    assert N == 128 and A == 32 and TR == 16 and PL in (32, 64) and R % RB == 0
+    if rng is None:
+        rng = mx.broadcast_to(mx.array([0, L], dtype=mx.int32)[None], (B, 2))
+    sc, cs, th, bc = _m3c_prep(proj, prm, st, rng, H, P, N, R, A, n_static)
+    key = ("m3c", H, P, N, R, A, n_static, PS)
+    if key not in _kernels:
+        src = f"""
+        constexpr int NT = {NT}, RB = {RB};
+        constexpr int H = {H}, P = {P}, N = {N}, R = {R}, A = {A}, T = {T}, TR = {TR}, PL = {PL}, PS = {PS};
+        constexpr int PH = 2 * P + 3, PW = {n_static} + 2 * R * N + A;
+        constexpr int SW = {SW}, OK_ = P * N, OX = OK_ + R * N, OA = OX + P;
+        constexpr int O_D = H, O_BN = 2 * H, O_CN = O_BN + N, O_BB = O_CN + N, O_CB = O_BB + H * R * N;
+        constexpr int O_MX = O_CB + H * R * N, O_MZ = O_MX + H * R * P, O_MO = O_MZ + H * R * P;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint sg = tid / 32, lane = tid % 32;
+        {_FRAG}
+        const int blk = threadgroup_position_in_grid.x;
+        const int b = blk / (H * PS), h = (blk / PS) % H, ph = blk % PS, p0 = ph * PL;
+        const int L = proj_shape[1];
+        const int s0 = rng[2 * b], s1 = rng[2 * b + 1];
+        const device float* pr0 = proj + (size_t)b * L * PW;
+        const device float4* sc0 = (const device float4*)sc + (size_t)b * L * H + h;
+        const device float* cs0 = cs + ((size_t)b * L * H + h) * 2 * A;
+        const device float* bc0 = bc + (size_t)b * L * 2 * R * N;
+        const device float* sin_ = st + ((size_t)b * H + h) * SW;
+        device float* sout = st_out + ((size_t)b * H + h) * SW;
+
+        constexpr int NP = N + 4, PLP = PL + 4, TRP = TR + 4;   // padded rows (bank conflicts)
+        threadgroup float Qs[TR][NP];
+        threadgroup float Ks[TR][NP];
+        threadgroup float Vs[TR][PLP];
+        threadgroup float Ves[TR][PLP];
+        threadgroup float Gs[TR][TRP];
+        threadgroup float Os[PL][TRP];
+
+        const float Dh = prm[O_D + h];
+        const int pb = sg >> 1, nh = sg & 1;     // state tiles of this simdgroup
+        // rows built by this simdgroup: token tb, K or Q, r in [r0, r0 + RB)
+        const int tb = sg / (2 * R / RB), isq = (sg / (R / RB)) & 1, r0 = (sg % (R / RB)) * RB;
+        float4 bb[RB];
+        for (int r = 0; r < RB; ++r) bb[r] = ((const device float4*)(prm + (isq ? O_CB : O_BB) + (h * R + r0 + r) * N))[lane];
+        auto load_sc = [&](int t) {{ return t >= s0 && t < s1 ? sc0[(size_t)t * H] : float4(0); }};
+
+        simdgroup_float8x8 Sm[8];
+        for (int j = 0; j < 8; ++j) simdgroup_load(Sm[j], sin_ + (p0 + pb * 8) * N + (nh * 8 + j) * 8, N);
+
+        // trapezoid term of the first token: S += delta_s0 * v_prev^T k_prev (rows 0..R-1, padded to 8)
+        {{
+            const float d0 = load_sc(s0).z;
+            for (int i = tid; i < 8 * N; i += NT) {{
+                const int r = i / N, n = i % N;
+                Ks[r][n] = r < R ? sin_[OK_ + r * N + n] : 0.0f;
+            }}
+            for (int i = tid; i < 8 * PL; i += NT) {{
+                const int r = i / PL, pl = i % PL;
+                Vs[r][pl] = r < R ? d0 * sin_[OX + p0 + pl] * prm[O_MX + (h * R + r) * P + p0 + pl] : 0.0f;
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_float8x8 vt, kt;
+            simdgroup_load(vt, &Vs[0][pb * 8], PLP, 0, true);
+            for (int j = 0; j < 8; ++j) {{
+                simdgroup_load(kt, &Ks[0][(nh * 8 + j) * 8], NP);
+                simdgroup_multiply_accumulate(Sm[j], vt, kt, Sm[j]);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // per-thread constants for the output (fixed (t, p)) and for the V rows
+        const int yt = tid / PL, ypl = tid % PL, yp = p0 + ypl;
+        float cmx[R], cmz[R], cmo[R], vmx[2];
+        for (int r = 0; r < R; ++r) {{
+            cmx[r] = prm[O_MX + (h * R + r) * P + yp];
+            cmz[r] = prm[O_MZ + (h * R + r) * P + yp];
+            cmo[r] = prm[O_MO + (h * R + r) * P + yp];
+        }}
+        for (int k = 0; k < 2; ++k) {{
+            const int row = (tid + NT * k) / PL;
+            vmx[k] = prm[O_MX + (h * R + row % R) * P + p0 + ypl];
+        }}
+        const bool rot = (lane & 15) < 8;
+        const int ai = 4 * (lane & 7);
+
+        // inputs of chunk c (fetched one chunk ahead)
+        float4 scv_n, cs_n, sn_n, bc_n[RB];
+        float x_n0, x_n1;
+#define M3C_FETCH(c) {{ \
+            scv_n = load_sc(lane <= T ? (c) + lane : -1); \
+            const int tc_ = min((c) + tb, L - 1); \
+            cs_n = *(const device float4*)(cs0 + (size_t)tc_ * H * 2 * A + ai); \
+            sn_n = *(const device float4*)(cs0 + (size_t)tc_ * H * 2 * A + A + ai); \
+            for (int r = 0; r < RB; ++r) bc_n[r] = ((const device float4*)(bc0 + ((size_t)tc_ * 2 * R + isq * R + r0 + r) * N))[lane]; \
+            x_n0 = pr0[(size_t)min((c) + xs0, L - 1) * PW + h * PH + P + p0 + ypl]; \
+            x_n1 = pr0[(size_t)min((c) + xs1, L - 1) * PW + h * PH + P + p0 + ypl]; \
+            const int ty_ = min((c) + min(yt, T - 1), L - 1); \
+            (void)ty_; }}
+        const int xs0 = tid / PL / R, xs1 = (tid + NT) / PL / R;
+        if (s1 > s0) M3C_FETCH(s0);
+        for (int c0 = s0; c0 < s1; c0 += T) {{
+            const float4 scv = scv_n;
+            const int ty = min(c0 + min(yt, T - 1), L - 1);
+            const float yx = pr0[(size_t)ty * PW + h * PH + P + yp], yz = pr0[(size_t)ty * PW + h * PH + yp];
+            // token scalars: lane t < T for token c0 + t, lane T for the next chunk's first token
+            const float la = scv.x, gam = scv.y, del = scv.z;
+            const float cum = simd_prefix_inclusive_sum(lane < T ? la : 0.0f);
+            const float cumT = simd_shuffle(cum, T - 1);
+            const float gw = gam + simd_shuffle_down(del, 1);       // weight of u_t for later tokens
+            const float e = lane < T ? exp(cumT - cum) * gw : 0.0f;  // weight of u_t in the chunk's state update
+
+            // build: K / Q rows (bias, rotate) of token tb, V and e * V
+            {{
+                const int t = c0 + tb;
+                const bool ok = t < s1;
+                for (int rr = 0; rr < RB; ++rr) {{
+                    const int r = r0 + rr;
+                    float4 val = ok ? bc_n[rr] + bb[rr] : 0.0f;
+                    const float4 partner = simd_shuffle_xor(val, 16);
+                    if (rot) val = (lane < 16) ? (val * cs_n - partner * sn_n) : (partner * sn_n + val * cs_n);
+                    threadgroup float4* dst = (threadgroup float4*)(isq ? &Qs[tb * R + r][0] : &Ks[tb * R + r][0]);
+                    dst[lane] = val;
+                    if (t == s1 - 1 && !isq && ph == 0) ((device float4*)(sout + OK_ + r * N))[lane] = val;
+                }}
+                for (int k = 0; k < 2; ++k) {{
+                    const int i = tid + NT * k;
+                    const int row = i / PL, pl = i % PL, s = row / R;
+                    const int ts = c0 + s;
+                    const float x = ts < s1 ? (k == 0 ? x_n0 : x_n1) : 0.0f;
+                    const float v = x * vmx[k];
+                    Vs[row][pl] = v;
+                    Ves[row][pl] = v * simd_shuffle(e, s);
+                    if (row % R == 0 && ts == s1 - 1) sout[OX + p0 + pl] = x;
+                }}
+            }}
+            if (c0 + T < s1) M3C_FETCH(c0 + T);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // inter-chunk part from the state, then the state update (same registers)
+            simdgroup_float8x8 oi[2], tq, tk;
+            for (int i = 0; i < 2; ++i) {{
+                oi[i] = simdgroup_float8x8(0);
+                for (int j = 0; j < 8; ++j) {{
+                    simdgroup_load(tq, &Qs[i * 8][(nh * 8 + j) * 8], NP, 0, true);
+                    simdgroup_multiply_accumulate(oi[i], Sm[j], tq, oi[i]);
+                }}
+                // column (t, r) scaled by exp(cum_t)
+                auto el = oi[i].thread_elements();
+                const int tc = (i * 8 + _FN) / R;   // _FN and _FN + 1 belong to the same token (R == 4)
+                const float sc_ = exp(simd_shuffle(cum, tc));
+                el[0] *= sc_; el[1] *= sc_;
+                oi[i].thread_elements() = el;
+            }}
+            {{
+                const float ac = exp(cumT);
+                simdgroup_float8x8 vt[2];
+                for (int k = 0; k < 2; ++k) simdgroup_load(vt[k], &Ves[k * 8][pb * 8], PLP, 0, true);
+                for (int j = 0; j < 8; ++j) {{
+                    Sm[j].thread_elements()[0] *= ac;
+                    Sm[j].thread_elements()[1] *= ac;
+                    for (int k = 0; k < 2; ++k) {{
+                        simdgroup_load(tk, &Ks[k * 8][(nh * 8 + j) * 8], NP);
+                        simdgroup_multiply_accumulate(Sm[j], vt[k], tk, Sm[j]);
+                    }}
+                }}
+            }}
+            // intra-chunk scores G^T = K Q^T with the decay mask (simdgroups 0..3, one tile each)
+            if (sg < 4) {{
+                const int ki = sg >> 1, qi = sg & 1;
+                simdgroup_float8x8 g = simdgroup_float8x8(0);
+                for (int j = 0; j < N / 8; ++j) {{
+                    simdgroup_load(tk, &Ks[ki * 8][j * 8], NP);
+                    simdgroup_load(tq, &Qs[qi * 8][j * 8], NP, 0, true);
+                    simdgroup_multiply_accumulate(g, tk, tq, g);
+                }}
+                auto el = g.thread_elements();
+                const int s = (ki * 8 + _FM) / R, t = (qi * 8 + _FN) / R;
+                const float cs_ = simd_shuffle(cum, s), ct = simd_shuffle(cum, t);
+                const float gs = simd_shuffle(gw, s), gt = simd_shuffle(gam, t);
+                const float m = s < t ? exp(ct - cs_) * gs : (s == t ? gt : 0.0f);
+                el[0] *= m; el[1] *= m;
+                g.thread_elements() = el;
+                simdgroup_store(g, &Gs[ki * 8][qi * 8], TRP);
+            }}
+            if (nh == 1) for (int i = 0; i < 2; ++i) simdgroup_store(oi[i], &Os[pb * 8][i * 8], TRP);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (nh == 0) {{
+                simdgroup_float8x8 vt, gg, o2;
+                for (int i = 0; i < 2; ++i) {{
+                    simdgroup_load(o2, &Os[pb * 8][i * 8], TRP);
+                    auto a = oi[i].thread_elements();
+                    const auto c = o2.thread_elements();
+                    a[0] += c[0]; a[1] += c[1];
+                    oi[i].thread_elements() = a;
+                    for (int k = 0; k < 2; ++k) {{
+                        simdgroup_load(vt, &Vs[k * 8][pb * 8], PLP, 0, true);
+                        simdgroup_load(gg, &Gs[k * 8][i * 8], TRP);
+                        simdgroup_multiply_accumulate(oi[i], vt, gg, oi[i]);
+                    }}
+                    simdgroup_store(oi[i], &Os[pb * 8][i * 8], TRP);
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // y_t = sum_r w_tr * (D v_tr + O_tr)
+            if (yt < T && c0 + yt < s1) {{
+                const float x = yx, z = yz;
+                float acc = 0;
+                for (int r = 0; r < R; ++r) {{
+                    const float zz = z * cmz[r];
+                    acc += zz / (1.0f + exp(-zz)) * cmo[r] * (Dh * x * cmx[r] + Os[ypl][yt * R + r]);
+                }}
+                y[((size_t)b * L + c0 + yt) * H * P + h * P + yp] = acc;
+            }}
+        }}
+#undef M3C_FETCH
+        for (int j = 0; j < 8; ++j) simdgroup_store(Sm[j], sout + (p0 + pb * 8) * N + (nh * 8 + j) * 8, N);
+        if (ph == 0 && sg == 0) sout[OA + lane] = th[((size_t)b * H + h) * A + lane];
+        if (s1 <= s0) {{
+            for (int i = tid; i < PL; i += NT) sout[OX + p0 + i] = sin_[OX + p0 + i];
+            if (ph == 0) for (int i = tid; i < R * N; i += NT) sout[OK_ + i] = sin_[OK_ + i];
+        }}
+        """
+        _kernels[key] = mx.fast.metal_kernel(
+            name="olala_m3c",
+            input_names=["proj", "prm", "st", "rng", "sc", "cs", "th", "bc"],
+            output_names=["y", "st_out"],
+            source=src,
+            header=_HDR,
+        )
+    y, st_out = _kernels[key](
+        inputs=[proj, prm, st, rng, sc, cs, th, bc],
+        grid=(B * H * PS * NSG_ * 32, 1, 1),
+        threadgroup=(NSG_ * 32, 1, 1),
+        output_shapes=[(B, L, H * P), (B, H, SW)],
+        output_dtypes=[mx.float32, mx.float32],
+        init_value=0,
+    )
+    return y, st_out
+
+
 # --------------------------------------------------------------------------
 # MoE experts
 # --------------------------------------------------------------------------

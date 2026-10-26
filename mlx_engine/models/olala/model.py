@@ -41,6 +41,7 @@ from . import kernels
 
 # compute every matmul input in f32 (slow with bf16 weights; for accuracy checks)
 _ACT_F32 = os.environ.get("OLALA_ACT_F32", "0") == "1"
+_M3_CHUNKED = os.environ.get("OLALA_M3_CHUNKED", "1") == "1"
 
 
 @dataclass
@@ -294,7 +295,8 @@ class Mamba3Mixer(nn.Module):
         return y
 
     def _fused_prefill(self, out, cache):
-        """Sequential Metal kernel over the prompt (metal.m3_prefill)."""
+        """Metal kernel over the prompt: chunked (metal.m3_chunked), or sequential
+        (metal.m3_prefill) with OLALA_M3_CHUNKED=0."""
         from . import metal
 
         Bsz, L, _ = out.shape
@@ -323,7 +325,8 @@ class Mamba3Mixer(nn.Module):
                     else mx.minimum(lengths, L).astype(mx.int32)
                 )
                 rng = mx.stack([s0, mx.maximum(s1, s0)], axis=1)
-        y, st = metal.m3_prefill(
+        prefill = metal.m3_chunked if _M3_CHUNKED else metal.m3_prefill
+        y, st = prefill(
             out.astype(mx.float32),
             self._prm,
             st.astype(mx.float32),

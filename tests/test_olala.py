@@ -103,6 +103,22 @@ def test_chunked_prefill_matches_stepwise(monkeypatch):
     assert mx.allclose(full, mx.concatenate(steps, axis=1), atol=1e-4).item()
 
 
+def test_m3_chunked_matches_sequential():
+    m = _tiny_model().layers[0].mixer
+    B, L = 3, 37
+    proj = mx.random.normal((B, L, m.n_static + m.n_dyn))
+    sw = m.P * m.N + m.R * m.N + m.P + m.A
+    st = mx.random.normal((B, m.H, sw)) * 0.1
+    rng = mx.array([[0, L], [3, L - 6], [5, 5]], dtype=mx.int32)
+    prm = metal.m3_param_pack(m)
+    args = (prm, st, m.H, m.P, m.N, m.R, m.A, m.n_static)
+    y0, s0 = metal.m3_prefill(proj, *args, rng=rng)
+    y1, s1 = metal.m3_chunked(proj, *args, rng=rng)
+    assert mx.allclose(s0, s1, atol=1e-4, rtol=1e-4).item()
+    for b, (a, e) in enumerate(rng.tolist()):
+        assert mx.allclose(y0[b, a:e], y1[b, a:e], atol=1e-4, rtol=1e-4).item()
+
+
 def test_cache_layout_one_entry_per_layer():
     m = _tiny_model()
     cache = m.make_cache()
