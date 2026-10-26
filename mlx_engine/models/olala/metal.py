@@ -824,6 +824,194 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static, wmp=None, gmix=None):
     )
 
 
+M3P_PB = int(os.environ.get("OLALA_M3P_PB", "64"))  # state rows per threadgroup in m3_prefill
+
+
+def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
+    """Sequential Mamba-3 MIMO over a prompt, fused (prep + state sweep per token).
+
+    proj: (B, L, n_static + n_dyn) f32; prm: m3_param_pack(); st: packed state (B, H, SW).
+    rng: optional (B, 2) int32 valid token range [s0, s1) per row (padding).
+    Returns y (B, L, H*P) f32 and the new packed state.
+
+    Threadgroup = (row, head, block of PB state rows), 16 simdgroups, one state row per
+    simdgroup and lane = 4 consecutive state columns, state kept in registers across tokens.
+    Simdgroups 0..2R-1 normalize / bias / rotate one row of [B | C] per token (lane = rotary
+    angle, carried in a register); the others build v and w for the block. Rotated keys /
+    queries and v / w are triple-buffered in threadgroup memory: one barrier per token."""
+    B, L, PW = proj.shape
+    SW = P * N + R * N + P + A
+    PB = M3P_PB
+    NSG_ = 16
+    assert N == 128 and A == 32 and 2 * R <= NSG_ and PB <= NSG_ * 4
+    if rng is None:
+        rng = mx.broadcast_to(mx.array([0, L], dtype=mx.int32)[None], (B, 2))
+    key = ("m3p", H, P, N, R, A, n_static, PB)
+    if key not in _kernels:
+        RPSG = (PB + NSG_ - 1) // NSG_
+        src = f"""
+        constexpr int H = {H}, P = {P}, N = {N}, R = {R}, A = {A}, PB = {PB}, NSGM = {NSG_}, RPSG = {RPSG};
+        constexpr int PH = 2 * P + 3, NS = {n_static}, PW = {n_static} + 2 * R * N + A;
+        constexpr int SW = {SW}, OK_ = P * N, OX = OK_ + R * N, OA = OX + P;
+        constexpr int O_DT = 0, O_D = H, O_BN = 2 * H, O_CN = O_BN + N, O_BB = O_CN + N, O_CB = O_BB + H * R * N;
+        constexpr int O_MX = O_CB + H * R * N, O_MZ = O_MX + H * R * P, O_MO = O_MZ + H * R * P;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint sg = tid / 32, lane = tid % 32;
+        const uint blk = threadgroup_position_in_grid.x;
+        const int npb = P / PB;
+        const int b = blk / (H * npb);
+        const int h = (blk / npb) % H;
+        const int pb = blk % npb;
+        const int L = proj_shape[1];
+        const int s0 = rng[2 * b], s1 = rng[2 * b + 1];
+        const device float* pr0 = proj + (size_t)b * L * PW;
+        const device float* sin_ = st + ((size_t)b * H + h) * SW;
+        device float* sout = st_out + ((size_t)b * H + h) * SW;
+
+        threadgroup float4 kqs[3][2 * R][N / 4];
+        threadgroup float vws[3][2][R][PB];      // [buf][v | w][r][row]
+
+        // constant per-head parameters
+        const float dtb = prm[O_DT + h], Dh = prm[O_D + h];
+        const bool kq_sg = sg < 2 * R;
+        const int gi = sg;
+        const bool isq = gi >= R;
+        const int rr = isq ? gi - R : gi;
+        float4 wn = 0, bb = 0;
+        if (kq_sg) {{
+            wn = ((const device float4*)(prm + (isq ? O_CN : O_BN)))[lane];
+            bb = ((const device float4*)(prm + (isq ? O_CB : O_BB) + (h * R + rr) * N))[lane];
+        }}
+        float th = sin_[OA + lane];                      // rotary angle of this lane (A == 32)
+        // state rows of this simdgroup
+        float4 srow[RPSG];
+        for (int i = 0; i < RPSG; ++i) {{
+            const int pl = sg + NSGM * i;
+            srow[i] = pl < PB ? ((const device float4*)(sin_ + (pb * PB + pl) * N))[lane] : 0;
+        }}
+        // seed buffer (s0 - 1) % 3 with the previous token: rotated k from the state, v from x
+        {{
+            const int pbuf = (s0 + 2) % 3;
+            if (sg < R) kqs[pbuf][sg][lane] = ((const device float4*)(sin_ + OK_ + sg * N))[lane];
+            for (int i = tid; i < R * PB; i += NSGM * 32) {{
+                const int r = i / PB, pl = i % PB, p = pb * PB + pl;
+                vws[pbuf][0][r][pl] = sin_[OX + p] * prm[O_MX + (h * R + r) * P + p];
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // per-thread constants for the v / w builders (fixed (r, row) items) and prefetched inputs
+        constexpr int VW_T = (NSGM - 2 * R) * 32;
+        constexpr int VW_N = (R * PB + VW_T - 1) / VW_T;
+        float cmx[VW_N], cmz[VW_N], cmo[VW_N];
+        int cp[VW_N], cr[VW_N], cpl[VW_N];
+        if (!kq_sg) {{
+            for (int j = 0; j < VW_N; ++j) {{
+                const int i = (tid - 2 * R * 32) + j * VW_T;
+                const int r = min(i, R * PB - 1) / PB, pl = min(i, R * PB - 1) % PB, p = pb * PB + pl;
+                cr[j] = i < R * PB ? r : -1; cpl[j] = pl; cp[j] = p;
+                cmx[j] = prm[O_MX + (h * R + r) * P + p];
+                cmz[j] = prm[O_MZ + (h * R + r) * P + p];
+                cmo[j] = prm[O_MO + (h * R + r) * P + p];
+            }}
+        }}
+        // prefetch registers for token t
+        float3 sc_n = 0; float ang_n = 0; float4 u_n = 0; float xz_n[VW_N][2];
+        auto fetch = [&](int t) {{
+            const device float* pr = pr0 + (size_t)t * PW;
+            const device float* ph = pr + h * PH;
+            sc_n = float3(ph[2 * P], ph[2 * P + 1], ph[2 * P + 2]);
+            ang_n = pr[NS + 2 * R * N + lane];
+            if (kq_sg) u_n = ((const device float4*)(pr + NS + gi * N))[lane];
+            else for (int j = 0; j < VW_N; ++j) {{ xz_n[j][0] = ph[P + cp[j]]; xz_n[j][1] = ph[cp[j]]; }}
+        }};
+        if (s1 > s0) fetch(s0);
+        for (int t = s0; t < s1; ++t) {{
+            const int cb = t % 3, pbuf = (t + 2) % 3;
+            const float3 scv = sc_n; const float angv = ang_n; const float4 u = u_n;
+            float xz[VW_N][2];
+            for (int j = 0; j < VW_N; ++j) {{ xz[j][0] = xz_n[j][0]; xz[j][1] = xz_n[j][1]; }}
+            if (t + 1 < s1) fetch(t + 1);
+            const float dt = olala_softplus(scv.x + dtb);
+            const float a = min(-olala_softplus(scv.y), -1e-4f);
+            const float alpha = exp(a * dt);
+            const float trap = olala_sigmoid(scv.z);
+            const float beta = (1.0f - trap) * dt * alpha;
+            const float gamma = trap * dt;
+            th = th + tanh(angv) * {math.pi}f * dt;
+            th = th - {2 * math.pi}f * rint(th * {0.5 / math.pi}f);
+            if (kq_sg) {{
+                const float ss = simd_sum(dot(u, u));
+                float4 val = u * rsqrt(ss / N + {1e-6}f) * wn + bb;
+                const float4 partner = simd_shuffle_xor(val, 16);
+                const int base = 4 * (lane & 15);
+                const float4 th4 = float4(simd_shuffle(th, (base + 0) & 31), simd_shuffle(th, (base + 1) & 31),
+                                          simd_shuffle(th, (base + 2) & 31), simd_shuffle(th, (base + 3) & 31));
+                if ((lane & 15) < 8) {{
+                    const float4 c = cos(th4), s = sin(th4);
+                    val = (lane < 16) ? (val * c - partner * s) : (partner * s + val * c);
+                }}
+                kqs[cb][gi][lane] = val;
+            }} else {{
+                for (int j = 0; j < VW_N; ++j) {{
+                    if (cr[j] < 0) continue;
+                    const float zz = xz[j][1] * cmz[j];
+                    vws[cb][0][cr[j]][cpl[j]] = xz[j][0] * cmx[j];
+                    vws[cb][1][cr[j]][cpl[j]] = zz / (1.0f + exp(-zz)) * cmo[j];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < RPSG; ++i) {{
+                const int pl = sg + NSGM * i;
+                if (pl >= PB) break;
+                float4 kv = 0, kvp = 0, qw = 0;
+                float d = 0;
+                for (int r = 0; r < R; ++r) {{
+                    const float vv = vws[cb][0][r][pl], ww = vws[cb][1][r][pl], vp = vws[pbuf][0][r][pl];
+                    kv += vv * kqs[cb][r][lane];
+                    kvp += vp * kqs[pbuf][r][lane];
+                    qw += ww * kqs[cb][R + r][lane];
+                    d += ww * vv;
+                }}
+                srow[i] = alpha * srow[i] + beta * kvp + gamma * kv;
+                const float acc = simd_sum(dot(srow[i], qw));
+                if (lane == 0) y[((size_t)b * L + t) * H * P + h * P + pb * PB + pl] = acc + Dh * d;
+            }}
+        }}
+        // new state: S rows, x of the last token, rotated k of the last token, angles
+        for (int i = 0; i < RPSG; ++i) {{
+            const int pl = sg + NSGM * i;
+            if (pl < PB) ((device float4*)(sout + (pb * PB + pl) * N))[lane] = srow[i];
+        }}
+        const int lastb = (s1 + 2) % 3;
+        if (s1 > s0) {{
+            for (int i = tid; i < PB; i += NSGM * 32) sout[OX + pb * PB + i] = pr0[(size_t)(s1 - 1) * PW + h * PH + P + pb * PB + i];
+            if (pb == 0) {{
+                if (sg < R) ((device float4*)(sout + OK_ + sg * N))[lane] = kqs[lastb][sg][lane];
+                if (sg == 0) sout[OA + lane] = th;
+            }}
+        }} else {{
+            for (int i = tid; i < PB; i += NSGM * 32) sout[OX + pb * PB + i] = sin_[OX + pb * PB + i];
+            if (pb == 0) {{
+                if (sg < R) ((device float4*)(sout + OK_ + sg * N))[lane] = ((const device float4*)(sin_ + OK_ + sg * N))[lane];
+                if (sg == 0) sout[OA + lane] = th;
+            }}
+        }}
+        """
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"olala_m3p_{PB}", input_names=["proj", "prm", "st", "rng"], output_names=["y", "st_out"],
+            source=src, header=_HDR,
+        )
+    npb = P // PB
+    return _kernels[key](
+        inputs=[proj, prm, st, rng],
+        grid=(B * H * npb * NSG_ * 32, 1, 1),
+        threadgroup=(NSG_ * 32, 1, 1),
+        output_shapes=[(B, L, H * P), (B, H, SW)],
+        output_dtypes=[mx.float32, mx.float32],
+        init_value=0,
+    )
+
+
 # --------------------------------------------------------------------------
 # MoE experts
 # --------------------------------------------------------------------------

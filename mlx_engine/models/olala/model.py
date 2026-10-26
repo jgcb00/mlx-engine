@@ -238,6 +238,10 @@ class Mamba3Mixer(nn.Module):
     def __call__(self, h: mx.array, cache: ArraysCache | None, mask: mx.array | None):
         L = h.shape[1]
         out = self.in_proj(h)
+        from . import metal
+
+        if L > 1 and metal.enabled() and os.environ.get("OLALA_FUSED_PREFILL", "1") == "1":
+            return self._fused_prefill(out, cache)
         proj, dyn = out[..., : self.n_static], out[..., self.n_static :]
         state = None
         if cache is not None and cache[0] is not None:
@@ -255,6 +259,32 @@ class Mamba3Mixer(nn.Module):
             if hasattr(cache, "advance"):
                 cache.advance(L)
         return y
+
+
+    def _fused_prefill(self, out, cache):
+        """Sequential Metal kernel over the prompt (metal.m3_prefill)."""
+        from . import kernels, metal
+
+        Bsz, L, _ = out.shape
+        if not hasattr(self, "_prm"):
+            self._prm = metal.m3_param_pack(self)
+        sw = self.P * self.N + self.R * self.N + self.P + self.A
+        st = cache[0] if cache is not None and cache[0] is not None else mx.zeros((Bsz, self.H, sw), mx.float32)
+        rng = None
+        if cache is not None:
+            lp = getattr(cache, "left_padding", None)
+            lengths = getattr(cache, "lengths", None)
+            if lp is not None or lengths is not None:
+                s0 = mx.zeros((Bsz,), mx.int32) if lp is None else mx.maximum(lp, 0).astype(mx.int32)
+                s1 = mx.full((Bsz,), L, mx.int32) if lengths is None else mx.minimum(lengths, L).astype(mx.int32)
+                rng = mx.stack([s0, mx.maximum(s1, s0)], axis=1)
+        y, st = metal.m3_prefill(out.astype(mx.float32), self._prm, st.astype(mx.float32), self.H, self.P, self.N,
+                                 self.R, self.A, self.n_static, rng=rng)
+        if cache is not None:
+            cache[0] = st
+            if hasattr(cache, "advance"):
+                cache.advance(L)
+        return y.astype(out.dtype) if out.dtype != mx.float32 else y
 
 
 class DiffTPAttention(nn.Module):
