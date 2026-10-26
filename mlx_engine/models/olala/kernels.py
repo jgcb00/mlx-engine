@@ -54,6 +54,28 @@ def _m3_prep(proj, dyn, m, mask):
     return x, z, dt, a * dt, trap, Bn, Cn, ang_inc
 
 
+def m3_unpack(st, m):
+    """Packed state (B, H, P*N + R*N + P + A) -> (angle, S, k, x)."""
+    B = st.shape[0]
+    H, R, N, P, A = m.H, m.R, m.N, m.P, m.A
+    o1, o2, o3 = P * N, P * N + R * N, P * N + R * N + P
+    return (
+        st[..., o3:],
+        st[..., :o1].reshape(B, H, P, N),
+        st[..., o1:o2].reshape(B, H, R, N),
+        st[..., o2:o3],
+    )
+
+
+def m3_pack(state, m):
+    ang, S, k, x = state
+    B, H = S.shape[:2]
+    return mx.concatenate(
+        [S.reshape(B, H, -1), k.reshape(B, H, -1).astype(mx.float32), x.astype(mx.float32), ang.astype(mx.float32)],
+        axis=-1,
+    )
+
+
 def _rotate(t, cos, sin, A):
     """Rotate pairs (i, i + 2A) for i < A along the last axis. t: (..., N); cos/sin: (..., A)."""
     t0 = t[..., :A]
@@ -75,12 +97,6 @@ def mamba3_forward(proj, dyn, state, m, mask=None, lengths=None):
     state: None or (angle (B,H,A), ssm (B,H,P,N), k (B,H,R,N), x (B,H,P)).
     Returns y (B, L, H*P) in proj.dtype and the new state.
     """
-    from . import metal
-
-    if metal.enabled() and mask is None:
-        out = metal.mamba3_forward(proj, dyn, state, m)
-        if out is not None:
-            return out
     Bsz, L, _ = proj.shape
     H, R, N, P, A = m.H, m.R, m.N, m.P, m.A
     if state is None:
@@ -250,12 +266,6 @@ def _mamba3_chunked_ref(proj, dyn, state, m, mask, lengths):
 
 def softcap_attention(q, k, v, scale, softcap, mask):
     """q: (B,Hq,L,D), k/v: (B,Hk,T,D). mask: None, "causal" or bool array broadcastable to (B,1,L,T)."""
-    from . import metal
-
-    if metal.enabled():
-        out = metal.softcap_attention(q, k, v, scale, softcap, mask)
-        if out is not None:
-            return out
     B, Hq, L, D = q.shape
     Hk, T = k.shape[1], k.shape[2]
     G = Hq // Hk
