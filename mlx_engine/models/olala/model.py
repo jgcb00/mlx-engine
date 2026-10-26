@@ -197,8 +197,30 @@ class _Geodesic(nn.Module):
         self.bias = mx.zeros((1,))
 
 
+_geo_cache = {}
+
+
+class _Geo:
+    def __init__(self, scale, bias):
+        self.scale, self.bias = scale, bias
+
+
 def geodesic_update(x: mx.array, g: mx.array, scale, bias, layer_idx: int) -> mx.array:
     """Rotate the residual x towards the update g (OlalaGeodesicNorm), in f32."""
+    from . import metal
+
+    if metal.enabled() and not _ACT_F32:
+        key = (id(scale), id(bias), layer_idx)
+        geo = _geo_cache.get(key)
+        if geo is None or geo[0] is not scale:
+            geo = (scale, metal.geo_params(_Geo(scale, bias), layer_idx))
+            _geo_cache[key] = geo
+        D = x.shape[-1]
+        n = x.size // D
+        out = metal.geodesic(
+            x.reshape(n, D), g.astype(mx.float32).reshape(n, D), geo[1], layer_idx, n, D
+        )
+        return out.reshape(x.shape)
     g = g.astype(mx.float32)
     x_norm_sq = mx.maximum(mx.sum(x * x, axis=-1, keepdims=True), 1e-12)
     proj = mx.sum(x * g, axis=-1, keepdims=True) / x_norm_sq
@@ -438,9 +460,19 @@ class DiffTPAttention(nn.Module):
         v = v.astype(dtype).transpose(0, 2, 1, 3)
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
-        o = kernels.softcap_attention(
-            q, k, v, self.scale, self.softcap, mask
-        )  # (B,Hq,L,Dh)
+        from . import metal
+
+        if (
+            L > 1
+            and metal.enabled()
+            and (kv_cache is None or isinstance(kv_cache.offset, int))
+        ):
+            # single sequence: the mask is causal (+ window), handled inside the kernel
+            o = metal.attn_prefill(q, k, v, self.scale, self.softcap, self.window)
+        else:
+            o = kernels.softcap_attention(
+                q, k, v, self.scale, self.softcap, mask
+            )  # (B,Hq,L,Dh)
         o = o.transpose(0, 2, 1, 3).reshape(B, L, self.n_noise, self.snr + 1, Dh)
         o = o[..., : self.snr, :].astype(mx.float32) - lam * o[
             ..., self.snr :, :

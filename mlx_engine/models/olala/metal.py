@@ -287,7 +287,7 @@ def _geo_prologue(K, T, LI):
         const float tn = max(sqrt(sgg), 1e-8f);
         const float rr = max(sqrt(xx), 1e-6f);
         float theta = min(tn / rr, {math.pi / 4}f);
-        theta = min((theta * scale + gbias) / {LI + 1}.0f, {math.pi / 4}f);
+        theta = min((theta * scale + gbias) / geo[2], {math.pi / 4}f);
         const float c = cos(theta), s = sin(theta) * rr / tn;
         for (int j = 0; j < {EPT}; ++j) {{
             const uint i = tid + j * {NT};
@@ -351,7 +351,8 @@ def gemv_kernel(
     """segs: list of (fmt, gs, rows). Output j is (rows_valid, rows_j) f32. T is the compile-time
     maximum number of rows (see _row_bucket); the actual count TN comes from the input tcnt.
     ndeps extra (unused) inputs order the kernel after the kernels that produced them."""
-    key = ("gemv", K, T, tuple(segs), prologue, LI, Ka, sa, sb, x_in_tg, RPS, ndeps)
+    # the layer index of a geodesic prologue is read from geo[2] at run time
+    key = ("gemv", K, T, tuple(segs), prologue, Ka, sa, sb, x_in_tg, RPS, ndeps)
     if key in _kernels:
         return _kernels[key]
     fmts = [s[0] for s in segs]
@@ -587,9 +588,20 @@ def gemv(
 # --------------------------------------------------------------------------
 
 
+def geo_params(module, layer_idx):
+    """[scale, bias, layer_idx + 1] (f32) of a geodesic update, as read by the kernels."""
+    return mx.concatenate(
+        [
+            module.scale.astype(mx.float32).reshape(1),
+            module.bias.astype(mx.float32).reshape(1),
+            mx.array([layer_idx + 1.0], dtype=mx.float32),
+        ]
+    )
+
+
 def geodesic(xin, g, geo, LI, T, K):
     """Standalone geodesic update, one threadgroup per row."""
-    key = ("geo1", K, LI)
+    key = ("geo1", K)
     if key not in _kernels:
         body = (
             _geo_prologue(K, 1, LI)
@@ -609,7 +621,7 @@ def geodesic(xin, g, geo, LI, T, K):
             + body
         )
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"olala_geo1_{K}_{LI}",
+            name=f"olala_geo1_{K}",
             input_names=["xin", "g", "geo"],
             output_names=["xout"],
             source=src,
@@ -867,7 +879,7 @@ def m3_step(proj, prm, st, H, P, N, R, A, n_static, wmp=None, gmix=None):
 M3P_PB = 64  # state rows per threadgroup in m3_prefill
 
 
-def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
+def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None, seg=1, write_y=True):
     """Sequential Mamba-3 MIMO over a prompt, fused (prep + state sweep per token).
 
     proj: (B, L, n_static + n_dyn) f32; prm: m3_param_pack(); st: packed state (B, H, SW).
@@ -886,7 +898,7 @@ def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
     assert N == 128 and A == 32 and 2 * R <= NSG_ and PB <= NSG_ * 4
     if rng is None:
         rng = mx.broadcast_to(mx.array([0, L], dtype=mx.int32)[None], (B, 2))
-    key = ("m3p", H, P, N, R, A, n_static, PB)
+    key = ("m3p", H, P, N, R, A, n_static, PB, seg, write_y)
     if key not in _kernels:
         RPSG = (PB + NSG_ - 1) // NSG_
         src = f"""
@@ -904,7 +916,9 @@ def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
         const int pb = blk % npb;
         const int L = proj_shape[1];
         const int s0 = rng[2 * b], s1 = rng[2 * b + 1];
-        const device float* pr0 = proj + (size_t)b * L * PW;
+        constexpr int SEG = {seg};   // rows per batch entry (segments of the prompt)
+        const device float* pr0 = proj + (size_t)(b / SEG) * L * PW;
+        float lsum = 0;              // sum of log(alpha) over the range
         const device float* sin_ = st + ((size_t)b * H + h) * SW;
         device float* sout = st_out + ((size_t)b * H + h) * SW;
 
@@ -939,6 +953,17 @@ def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
             }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // kv of the token before the range (from the seeded buffer)
+        float4 kvprev[RPSG];
+        {{
+            const int sb0 = (s0 + 2) % 3;
+            for (int i = 0; i < RPSG; ++i) {{
+                const int pl = sg + NSGM * i;
+                float4 a0 = 0;
+                if (pl < PB) for (int r = 0; r < R; ++r) a0 += vws[sb0][0][r][pl] * kqs[sb0][r][lane];
+                kvprev[i] = a0;
+            }}
+        }}
         // per-thread constants for the v / w builders (fixed (r, row) items) and prefetched inputs
         constexpr int VW_T = (NSGM - 2 * R) * 32;
         constexpr int VW_N = (R * PB + VW_T - 1) / VW_T;
@@ -974,6 +999,7 @@ def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
             const float dt = olala_softplus(scv.x + dtb);
             const float a = min(-olala_softplus(scv.y), -1e-4f);
             const float alpha = exp(a * dt);
+            lsum += a * dt;
             const float trap = olala_sigmoid(scv.z);
             const float beta = (1.0f - trap) * dt * alpha;
             const float gamma = trap * dt;
@@ -1000,23 +1026,27 @@ def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
                 }}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            float4 kr[R], qr[R];
+            for (int r = 0; r < R; ++r) {{ kr[r] = kqs[cb][r][lane]; qr[r] = kqs[cb][R + r][lane]; }}
             for (int i = 0; i < RPSG; ++i) {{
                 const int pl = sg + NSGM * i;
                 if (pl >= PB) break;
-                float4 kv = 0, kvp = 0, qw = 0;
+                float4 kv = 0, qw = 0;
                 float d = 0;
                 for (int r = 0; r < R; ++r) {{
-                    const float vv = vws[cb][0][r][pl], ww = vws[cb][1][r][pl], vp = vws[pbuf][0][r][pl];
-                    kv += vv * kqs[cb][r][lane];
-                    kvp += vp * kqs[pbuf][r][lane];
-                    qw += ww * kqs[cb][R + r][lane];
+                    const float vv = vws[cb][0][r][pl], ww = vws[cb][1][r][pl];
+                    kv += vv * kr[r];
+                    qw += ww * qr[r];
                     d += ww * vv;
                 }}
-                srow[i] = alpha * srow[i] + beta * kvp + gamma * kv;
+                // the previous token's outer-product term is this row's kv of the last step
+                srow[i] = alpha * srow[i] + beta * kvprev[i] + gamma * kv;
+                kvprev[i] = kv;
                 const float acc = simd_sum(dot(srow[i], qw));
-                if (lane == 0) y[((size_t)b * L + t) * H * P + h * P + pb * PB + pl] = acc + Dh * d;
+                {"if (lane == 0) y[((size_t)(b / SEG) * L + t) * H * P + h * P + pb * PB + pl] = acc + Dh * d;" if write_y else "(void)acc;"}
             }}
         }}
+        if (pb == 0 && tid == 0) logA[b * H + h] = lsum;
         // new state: S rows, x of the last token, rotated k of the last token, angles
         for (int i = 0; i < RPSG; ++i) {{
             const int pl = sg + NSGM * i;
@@ -1038,21 +1068,25 @@ def m3_prefill(proj, prm, st, H, P, N, R, A, n_static, rng=None):
         }}
         """
         _kernels[key] = mx.fast.metal_kernel(
-            name=f"olala_m3p_{PB}",
+            name=f"olala_m3p_{PB}_{seg}_{int(write_y)}",
             input_names=["proj", "prm", "st", "rng"],
-            output_names=["y", "st_out"],
+            output_names=["y", "st_out", "logA"],
             source=src,
             header=_HDR,
         )
     npb = P // PB
-    return _kernels[key](
+    rows = B * seg
+    y, st_out, log_a = _kernels[key](
         inputs=[proj, prm, st, rng],
-        grid=(B * H * npb * NSG_ * 32, 1, 1),
+        grid=(rows * H * npb * NSG_ * 32, 1, 1),
         threadgroup=(NSG_ * 32, 1, 1),
-        output_shapes=[(B, L, H * P), (B, H, SW)],
-        output_dtypes=[mx.float32, mx.float32],
+        output_shapes=[(B, L, H * P) if write_y else (1,), (rows, H, SW), (rows, H)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
         init_value=0,
     )
+    if seg == 1:
+        return y, st_out
+    return y, st_out, log_a
 
 
 # --------------------------------------------------------------------------
@@ -1464,6 +1498,111 @@ def attn_decode(
     )
 
 
+FA_BQ = 32  # queries per threadgroup in attn_prefill
+FA_BK = 32  # keys per block
+
+
+def attn_prefill(q, k, v, scale, softcap, window):
+    """Causal soft-capped attention for a prompt chunk, flash-attention style.
+
+    q (B, Hq, L, D) (any float dtype), k / v (B, Hk, T, D) with the chunk's queries at
+    positions T - L .. T - 1. Keys within ``window`` of the query. Returns (B, Hq, L, D) in
+    v's dtype. One threadgroup per (row, kv head, block of FA_BQ queries) processes the G
+    query heads sharing the kv head: thread = (head, query, quarter of the head dim)."""
+    B, Hq, L, D = q.shape
+    Hk = k.shape[1]
+    G = Hq // Hk
+    assert D == 128 and G * FA_BQ * 4 <= 1024
+    key = ("fa", Hq, Hk, D, str(q.dtype), str(k.dtype), str(v.dtype), int(window))
+    if key not in _kernels:
+        kt = {"bfloat16": "bfloat", "float16": "half", "float32": "float"}[
+            str(k.dtype).split(".")[-1]
+        ]
+        ot = {"bfloat16": "bfloat", "float16": "half", "float32": "float"}[
+            str(v.dtype).split(".")[-1]
+        ]
+        src = f"""
+        constexpr int Hq = {Hq}, Hk = {Hk}, D = {D}, G = {G}, BQ = {FA_BQ}, BK = {FA_BK}, DP = D / 4;
+        constexpr int WIN = {int(window)};
+        const uint tid = thread_position_in_threadgroup.x;
+        const int g = tid / (BQ * 4), qr = (tid / 4) % BQ, part = tid % 4;
+        const uint blk = threadgroup_position_in_grid.x;
+        const int L = q_shape[2], T = k_shape[2];
+        const int nqb = (L + BQ - 1) / BQ;
+        const int b = blk / (Hk * nqb);
+        const int hk = (blk / nqb) % Hk;
+        const int qb = blk % nqb;
+        const int hq = hk * G + g;
+        const int qi = qb * BQ + qr;                 // query index in the chunk
+        const int qpos = T - L + min(qi, L - 1);     // its key position
+        threadgroup {kt} ks[BK][D];
+        threadgroup {kt} vs[BK][D];
+        float qv[DP], o[DP];
+        const size_t qoff = (((size_t)b * Hq + hq) * L + min(qi, L - 1)) * D + part * DP;
+        for (int d = 0; d < DP; ++d) {{ qv[d] = float(q[qoff + d]) * {scale}f; o[d] = 0; }}
+        float m = -INFINITY, l = 0;
+        // key range of the whole threadgroup
+        const int qpos_lo = T - L + qb * BQ, qpos_hi = T - L + min(qb * BQ + BQ, L) - 1;
+        const int j_lo = max(0, qpos_lo - WIN), j_hi = qpos_hi;
+        const size_t kbase = (size_t)b * k_strides[0] + (size_t)hk * k_strides[1];
+        const size_t vbase = (size_t)b * v_strides[0] + (size_t)hk * v_strides[1];
+        for (int j0 = (j_lo / BK) * BK; j0 <= j_hi; j0 += BK) {{
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = tid; i < BK * D; i += G * BQ * 4) {{
+                const int jj = j0 + i / D;
+                ks[i / D][i % D] = jj < T ? k[kbase + (size_t)jj * k_strides[2] + i % D] : {kt}(0);
+                vs[i / D][i % D] = jj < T ? v[vbase + (size_t)jj * v_strides[2] + i % D] : {kt}(0);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float sc[BK];
+            float bm = -INFINITY;
+            for (int j = 0; j < BK; ++j) {{
+                float sp = 0;
+                for (int d = 0; d < DP; ++d) sp += qv[d] * float(ks[j][part * DP + d]);
+                sp += simd_shuffle_xor(sp, 1);
+                sp += simd_shuffle_xor(sp, 2);
+                const int jp = j0 + j;
+                const bool ok = jp <= qpos && jp >= qpos - WIN && jp < T;
+                sc[j] = ok ? tanh(sp / {softcap}f) * {softcap}f : -INFINITY;
+                bm = max(bm, sc[j]);
+            }}
+            const float mn = max(m, bm);
+            if (mn == -INFINITY) continue;
+            const float corr = exp(m - mn);
+            l *= corr;
+            for (int d = 0; d < DP; ++d) o[d] *= corr;
+            for (int j = 0; j < BK; ++j) {{
+                const float pj = exp(sc[j] - mn);
+                l += pj;
+                for (int d = 0; d < DP; ++d) o[d] += pj * float(vs[j][part * DP + d]);
+            }}
+            m = mn;
+        }}
+        if (qi < L) {{
+            const float inv = 1.0f / l;
+            const size_t ooff = (((size_t)b * Hq + hq) * L + qi) * D + part * DP;
+            for (int d = 0; d < DP; ++d) out[ooff + d] = ({ot})(o[d] * inv);
+        }}
+        """
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"olala_fa_{abs(hash(key)) % 10**12}",
+            input_names=["q", "k", "v"],
+            output_names=["out"],
+            source=src,
+            header=_HDR,
+            ensure_row_contiguous=False,
+        )
+    q = mx.contiguous(q)
+    nqb = (L + FA_BQ - 1) // FA_BQ
+    return _kernels[key](
+        inputs=[q, k, v],
+        grid=(B * Hk * nqb * G * FA_BQ * 4, 1, 1),
+        threadgroup=(G * FA_BQ * 4, 1, 1),
+        output_shapes=[(B, Hq, L, D)],
+        output_dtypes=[v.dtype],
+    )[0]
+
+
 def attn_combine(
     o, m, l, small, big, Hq, Hk, Dh, snr, n_noise, gate_bias, T, small_off, big_off
 ):
@@ -1559,12 +1698,8 @@ class _Plan:
                 }
                 L["attn"] = mx_
             L["mixer_proj"] = W(layer.mixer_proj)
-            L["geo_mixer"] = mx.concatenate(
-                [layer.geodesic_mixer.scale, layer.geodesic_mixer.bias]
-            ).astype(f32)
-            L["geo_mlp"] = mx.concatenate(
-                [layer.geodesic_mlp.scale, layer.geodesic_mlp.bias]
-            ).astype(f32)
+            L["geo_mixer"] = geo_params(layer.geodesic_mixer, layer.layer_idx)
+            L["geo_mlp"] = geo_params(layer.geodesic_mlp, layer.layer_idx)
             moe = layer.mlp
             L["router"] = W(moe.moe_gate)
             L["in_cat"] = W(moe.in_cat)
