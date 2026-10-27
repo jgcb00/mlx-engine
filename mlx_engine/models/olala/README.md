@@ -34,9 +34,12 @@ checkpoint does not need the HF remote code.
 
 | format | bytes / token | decode B=1 | share of 819 GB/s | B=4 total | B=64 total | prefill (8k, 2048 chunks) |
 |---|---|---|---|---|---|---|
-| bf16 | 2.58 GB | 183 tok/s | 58 % | 525 tok/s | 1829 tok/s | 3684 tok/s |
-| q8 | 1.45 GB | 245 tok/s | 43 % | 502 tok/s | 1751 tok/s | 3717 tok/s |
-| q6 | 1.14 GB | 271 tok/s | 38 % | 529 tok/s | 1726 tok/s | 3710 tok/s |
+| bf16 | 2.58 GB | 191 tok/s | 60 % | 545 tok/s | 1850 tok/s | 4750 tok/s |
+| q8 | 1.45 GB | 266 tok/s | 47 % | 535 tok/s | 1754 tok/s | 4840 tok/s |
+| q6 | 1.14 GB | 294 tok/s | 41 % | 570 tok/s | 1722 tok/s | 4790 tok/s |
+
+Decode B=1 after a longer prompt (q6 / bf16): 293 / 191 tok/s at 64 tokens of context,
+275 / 183 at 1k, 270 / 180 at 2.5k, 241 / 168 at 8k.
 
 For reference, llama.cpp (same machine, Metal) decodes one stream at 149 tok/s
 (bf16) and 178 tok/s (q8_0-safe2). Bytes / token counts every weight read for
@@ -63,8 +66,14 @@ Activations stay in f32; weights are read as bf16 / f16 / f32 or MLX affine
 use MLX's (q)matmul. Prefill uses MLX matmuls, a chunked Mamba-3 kernel
 (`m3_chunked`: chunks of 4 tokens, the state stays in registers as 8x8
 simdgroup matrices, ~3x faster than the sequential `m3_prefill`), a
-flash-attention style kernel with soft-capping (`attn_prefill`) and the fused
-geodesic kernel.
+flash-attention kernel with soft-capping on simdgroup matrices
+(`attn_prefill_mma`, ~2.5x faster than the scalar `attn_prefill`) and the fused
+geodesic kernel. At 8k tokens (q6) the prefill time splits into Mamba-3 ~24 %,
+MoE ~23 %, attention ~20 %, dense projections most of the rest.
+
+Decode attention uses `attn_decode_short` up to 1024 keys (lane = 4 dims, groups of 8 keys
+reduced with one butterfly reduce-scatter: latency-bound contexts) and a key-per-lane
+kernel beyond.
 
 Things measured along the way that shape the code:
 
@@ -86,17 +95,33 @@ Things measured along the way that shape the code:
   the multiply-adds of the full cache (all 48 heads against 4 rows per key, token
   shift included), which at the M3 Ultra's ~7 TFMA/s (simdgroup matrices) and
   819 GB/s is at best on par with reading the full cache.
+- A decode step is the sum of the latencies of its ~230 dependent kernels (~3.5 us dispatch
+  floor each on M3 Ultra, plus the first-load latency); kernels that depend on nothing
+  (e.g. zeroing a buffer) overlap and cost nothing. Removing 72 of them by moving the work
+  into the consumers made decoding 6 % slower.
+- Scaling a simdgroup-matrix accumulator through `thread_elements()` between products made
+  the prefill attention kernel ~8x slower; multiplying by a diagonal matrix instead keeps it
+  fast (the Mamba-3 kernel was not affected).
+- GEMV rows heavier than 4 KB (the f32 router next to the quantized `in_cat`) are split
+  across simdgroups: one heavy row per simdgroup made those threadgroups finish last.
 - Routed-expert outputs are summed with float atomics (fastest). The summation
   order then varies between runs; `OLALA_DETERMINISTIC=1` uses fixed-order partial
   sums instead (~3 % slower).
 
 Switches: `OLALA_FUSED=0` / `OLALA_FUSED_PREFILL=0` use the reference path for
-decode / prefill, `OLALA_M3_CHUNKED=0` the sequential Mamba-3 prefill kernel, `OLALA_MLX_REF=1` disables all Metal kernels, `OLALA_WARMUP=0`
-disables the kernel warm-up.
+decode / prefill, `OLALA_M3_CHUNKED=0` the sequential Mamba-3 prefill kernel,
+`OLALA_FA_MMA=0` the scalar prefill attention kernel, `OLALA_MLX_REF=1` disables all Metal
+kernels, `OLALA_WARMUP=0` disables the kernel warm-up.
+
+MLX commits a command buffer every few dozen operations by default; with
+`MLX_MAX_OPS_PER_BUFFER=400` set before MLX is imported, decoding is ~2 % faster
+(application-wide setting, not set here).
 
 ## Tests
 
 `tests/test_olala.py` (tiny random model, no checkpoint): fused decode against
 the reference path with f32 activations (bf16 and 8 / 6 / 5 / 4-bit), chunked
-prefill against token-by-token, chunked against sequential Mamba-3 kernel, cache layout, in-place KV semantics, weight
+prefill against token-by-token, chunked against sequential Mamba-3 kernel, split GEMV
+rows, MMA against scalar prefill attention, short against long-context decode attention,
+fused MoE against the reference experts, cache layout, in-place KV semantics, weight
 merging.
