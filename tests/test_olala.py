@@ -119,6 +119,40 @@ def test_m3_chunked_matches_sequential():
         assert mx.allclose(y0[b, a:e], y1[b, a:e], atol=1e-4, rtol=1e-4).item()
 
 
+@pytest.mark.parametrize("T", [1, 3])
+def test_gemv_split_rows_match_reference(T):
+    # an f32 segment next to a quantized one: the f32 rows are split across simdgroups
+    K = 1536
+    w32 = mx.random.normal((256, K)) * 0.05
+    wq = mx.random.normal((640, K)) * 0.05
+    q, s, b = mx.quantize(wq, group_size=64, bits=6)
+    ws = [metal.W(w32), metal.W(q, s, b, 6, 64)]
+    assert metal._gemv_splits([(w.fmt, w.gs or 0, w.rows) for w in ws], K, 8)[0] > 1
+    x = mx.random.normal((T, K))
+    xr = mx.random.normal((T, 640))
+    y32, yq = metal.gemv([x], ws, T=T)
+    assert mx.allclose(y32, x @ w32.T, atol=1e-4).item()
+    wdq = mx.dequantize(q, s, b, group_size=64, bits=6)
+    assert mx.allclose(yq, x @ wdq.T, atol=1e-4).item()
+    # geodesic sums of a split GEMV
+    y, gst = metal.gemv([x], [ws[1]], T=T, stats_x=xr)
+    ref = mx.stack([(xr * xr).sum(-1), (xr * y).sum(-1), (y * y).sum(-1)], -1)
+    assert mx.allclose(gst[: 4 * T].reshape(T, 4)[:, :3], ref, rtol=1e-4).item()
+
+
+@pytest.mark.parametrize(
+    "T,L,window", [(37, 37, 4096), (300, 133, 4096), (300, 300, 100)]
+)
+def test_attn_prefill_mma_matches_scalar(monkeypatch, T, L, window):
+    q = (mx.random.normal((1, 8, L, 128)) * 3).astype(mx.bfloat16)
+    k = (mx.random.normal((1, 2, T, 128)) * 3).astype(mx.bfloat16)
+    v = mx.random.normal((1, 2, T, 128)).astype(mx.bfloat16)
+    a = metal.attn_prefill_mma(q, k, v, 1 / 128, 150.0, window)
+    monkeypatch.setattr(metal, "_FA_MMA", False)
+    b = metal.attn_prefill(q, k, v, 1 / 128, 150.0, window)
+    assert mx.allclose(a.astype(mx.float32), b.astype(mx.float32), atol=1e-2).item()
+
+
 def test_cache_layout_one_entry_per_layer():
     m = _tiny_model()
     cache = m.make_cache()
