@@ -1949,6 +1949,129 @@ def _att_blk(S, Hk, T):
     return ATT_BLK
 
 
+ATT_SHORT_MAX = 1024  # contexts up to this many keys use attn_decode_short (M3 Ultra)
+
+
+def _reduce_scatter32(var):
+    """Code: after it, lane L holds in {var}[0] the sum over the 32 lanes of {var}[L] (5 butterfly
+    steps, 31 shuffles instead of 32 x 5 for 32 separate simd_sum)."""
+    out, n = [], 32
+    for o in (16, 8, 4, 2, 1):
+        h = n // 2
+        out.append(
+            f"{{ const bool hi = (lane & {o}) != 0; float w[{h}];"
+            f"for (int j = 0; j < {h}; ++j) {{ const float send = hi ? {var}[j] : {var}[j + {h}];"
+            f"const float keep = hi ? {var}[j + {h}] : {var}[j]; w[j] = keep + simd_shuffle_xor(send, {o}); }}"
+            f"for (int j = 0; j < {h}; ++j) {var}[j] = w[j]; }}"
+        )
+        n = h
+    return "\n".join(out)
+
+
+def attn_decode_short(q, keys, values, kstart, scale, softcap, T, Hq, Hk, Dh, S, slen):
+    """attn_decode for short contexts (latency-bound): lane = 4 dims, so every key / value row
+    is one coalesced load; each simdgroup takes groups of 8 keys, whose 8 x 4 partial scores
+    (4 query heads per kv head) are reduced with one butterfly reduce-scatter (lane = key * 4 +
+    head). Blocks of 32 / 64 keys: more threadgroups than the long-context kernel."""
+    G = Hq // Hk
+    NW = ATT_NW
+    BLK = 8 * NW  # larger blocks lost to the long-context kernel (measured)
+    NS = (S + BLK - 1) // BLK
+    assert Dh == 128 and G == 4
+    vt = {"bfloat16": "bfloat4", "float16": "half4", "float32": "float4"}[
+        str(keys.dtype).split(".")[-1]
+    ]
+    key = ("attn_short", Hq, Hk, Dh, vt, BLK, NW)
+    if key not in _kernels:
+        src = f"""
+        constexpr int Hq = {Hq}, Hk = {Hk}, Dh = {Dh}, G = 4, BLK = {BLK}, NW = {NW};
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint sg = tid / 32, lane = tid % 32;
+        const uint blk = threadgroup_position_in_grid.x;
+        const int S = slen[0];
+        const int NS = (S + BLK - 1) / BLK;
+        const int t = blk / (Hk * NS);
+        const int hk = (blk / NS) % Hk;
+        const int sp = blk % NS;
+        const int j0 = max(sp * BLK, kstart[t]);
+        const int j1 = min((sp + 1) * BLK, S);
+        float4 qv[G];  // this lane's 4 dims of the G heads
+        for (int g = 0; g < G; ++g)
+            qv[g] = ((const device float4*)(q + ((size_t)t * Hq + hk * G + g) * Dh))[lane] * {scale}f;
+        const device {vt}* kb = (const device {vt}*)(keys + (size_t)t * keys_strides[0] + (size_t)hk * keys_strides[1]);
+        const device {vt}* vb = (const device {vt}*)(values + (size_t)t * values_strides[0] + (size_t)hk * values_strides[1]);
+        const size_t ks4 = keys_strides[2] / 4, vs4 = values_strides[2] / 4;
+        float m = -INFINITY, l = 0;  // running max / sum of head lane & 3
+        float4 o[G];
+        for (int g = 0; g < G; ++g) o[g] = 0;
+        threadgroup float mo[NW][G];
+        threadgroup float lo[NW][G];
+        threadgroup float4 oo[NW][G][Dh / 4];
+        for (int jb = (j0 / 8) * 8 + sg * 8; jb < j1; jb += NW * 8) {{
+            float4 kv[8], vv[8];
+            for (int i = 0; i < 8; ++i) {{
+                const int j = min(jb + i, S - 1);
+                kv[i] = float4(kb[(size_t)j * ks4 + lane]);
+                vv[i] = float4(vb[(size_t)j * vs4 + lane]);
+            }}
+            float v[32];
+            for (int i = 0; i < 8; ++i) for (int g = 0; g < G; ++g) v[i * 4 + g] = dot(kv[i], qv[g]);
+            {_reduce_scatter32("v")}
+            const int jl = jb + (lane >> 2);
+            const float s = (jl >= j0 && jl < j1) ? tanh(v[0] / {softcap}f) * {softcap}f : -INFINITY;
+            float bm = max(s, simd_shuffle_xor(s, 4));
+            bm = max(bm, simd_shuffle_xor(bm, 8));
+            bm = max(bm, simd_shuffle_xor(bm, 16));
+            const float mn = max(m, bm);
+            const float corr = mn == -INFINITY ? 1.0f : exp(m - mn);
+            const float p = s == -INFINITY ? 0.0f : exp(s - mn);
+            float ps = p + simd_shuffle_xor(p, 4);
+            ps += simd_shuffle_xor(ps, 8);
+            ps += simd_shuffle_xor(ps, 16);
+            l = l * corr + ps;
+            m = mn;
+            for (int g = 0; g < G; ++g) {{
+                o[g] *= simd_shuffle(corr, g);
+                for (int i = 0; i < 8; ++i) o[g] += simd_shuffle(p, i * 4 + g) * vv[i];
+            }}
+        }}
+        for (int g = 0; g < G; ++g) {{
+            const float mg = simd_shuffle(m, g), lg = simd_shuffle(l, g);
+            if (lane == 0) {{ mo[sg][g] = mg; lo[sg][g] = lg; }}
+            oo[sg][g][lane] = o[g];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < G) {{
+            const int g = sg;
+            float M = -INFINITY;
+            for (int w = 0; w < NW; ++w) M = max(M, mo[w][g]);
+            float L = 0; float4 O = 0;
+            for (int w = 0; w < NW; ++w) {{
+                const float c = (mo[w][g] == -INFINITY) ? 0.0f : exp(mo[w][g] - M);
+                L += lo[w][g] * c; O += oo[w][g][lane] * c;
+            }}
+            const size_t oi = ((size_t)t * Hq + hk * G + g) * NS + sp;
+            ((device float4*)(o_out + oi * Dh))[lane] = O;
+            if (lane == 0) {{ m_out[oi] = M; l_out[oi] = L; }}
+        }}
+        """
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"olala_attn_short_{abs(hash(key)) % 10**12}",
+            input_names=["q", "keys", "values", "kstart", "slen"],
+            output_names=["o_out", "m_out", "l_out"],
+            source=src,
+            header=_HDR,
+            ensure_row_contiguous=False,
+        )
+    return _kernels[key](
+        inputs=[q, keys, values, kstart, slen],
+        grid=(T * Hk * NS * NW * 32, 1, 1),
+        threadgroup=(NW * 32, 1, 1),
+        output_shapes=[(T, Hq, NS, Dh), (T, Hq, NS), (T, Hq, NS)],
+        output_dtypes=[mx.float32] * 3,
+    )
+
+
 def attn_decode(
     q, keys, values, kstart, scale, softcap, T, Hq, Hk, Dh, S=None, slen=None
 ):
@@ -1961,6 +2084,10 @@ def attn_decode(
     S = S or keys.shape[2]
     if slen is None:
         slen = mx.array([S], dtype=mx.int32)
+    if S <= ATT_SHORT_MAX and Hq == 4 * Hk:
+        return attn_decode_short(
+            q, keys, values, kstart, scale, softcap, T, Hq, Hk, Dh, S, slen
+        )
     BLK = _att_blk(S, Hk, T)
     NS = (S + BLK - 1) // BLK
     G = Hq // Hk
@@ -2340,7 +2467,6 @@ def attn_combine(
 ):
     """Merge the key splits, apply the differential combination and the output gate.
     Returns (T, n_sig * Dh) f32."""
-    NS = o.shape[2]
     n_sig = Hq - n_noise
     key = (
         "attn_comb",
@@ -2348,7 +2474,6 @@ def attn_combine(
         Dh,
         snr,
         n_noise,
-        NS,
         small_off,
         big_off,
         small.shape[1],
@@ -2356,7 +2481,8 @@ def attn_combine(
     )
     if key not in _kernels:
         src = f"""
-        constexpr int Hq = {Hq}, Dh = {Dh}, SNR = {snr}, NN = {n_noise}, NS = {NS}, NSIG = {n_sig};
+        constexpr int Hq = {Hq}, Dh = {Dh}, SNR = {snr}, NN = {n_noise}, NSIG = {n_sig};
+        const int NS = m_shape[2];  // key splits (run time: no recompilation as the context grows)
         const uint d = thread_position_in_threadgroup.x;
         const uint blk = threadgroup_position_in_grid.x;
         const int t = blk / NSIG;
@@ -2764,6 +2890,17 @@ def _warmup(model, head_fn, rows):
         if isinstance(out, tuple):
             out = head_fn(out[0])
         mx.eval(out)
+    # the long-context attention kernel too: its first use would stall generation
+    for layer, c in zip(model.layers, cache):
+        if layer.layer_type == "V":
+            att, kc = layer.mixer, c[0]
+            Hq, Hk, Dh, S = att.n_heads, att.n_kv, att.head_dim, ATT_SHORT_MAX + 1
+            kv = mx.zeros((1, Hk, S, Dh), dtype=kc.keys.dtype)
+            q = mx.zeros((1, Hq, Dh))
+            ks = mx.zeros((1,), mx.int32)
+            args = (att.scale, att.softcap, 1, Hq, Hk, Dh)
+            mx.eval(attn_decode(q, kv, kv, ks, *args, S=S))
+            break
 
 
 _warmup_started = set()

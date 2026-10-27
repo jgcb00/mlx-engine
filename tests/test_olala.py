@@ -153,6 +153,31 @@ def test_attn_prefill_mma_matches_scalar(monkeypatch, T, L, window):
     assert mx.allclose(a.astype(mx.float32), b.astype(mx.float32), atol=1e-2).item()
 
 
+@pytest.mark.parametrize("S,kstart", [(5, 0), (70, 3), (300, 0)])
+def test_attn_decode_short_matches_long(S, kstart):
+    T, Hq, Hk, Dh = 2, 16, 4, 128
+    keys = (mx.random.normal((T, Hk, S + 9, Dh)) * 2).astype(mx.bfloat16)
+    values = mx.random.normal((T, Hk, S + 9, Dh)).astype(mx.bfloat16)
+    q = mx.random.normal((T, Hq, Dh)) * 3
+    ks = mx.array([kstart, 0], dtype=mx.int32)
+    args = (q, keys, values, ks, 1 / 128, 150.0, T, Hq, Hk, Dh)
+    slen = mx.array([S], dtype=mx.int32)
+
+    def merged(o, m, l):
+        M = m.max(axis=-1, keepdims=True)
+        c = mx.where(m == -mx.inf, 0, mx.exp(m - M))
+        return (o * c[..., None]).sum(-2) / (l * c).sum(-1)[..., None]
+
+    short = merged(*metal.attn_decode_short(*args, S, slen))
+    old = metal.ATT_SHORT_MAX
+    metal.ATT_SHORT_MAX = 0
+    try:
+        long = merged(*metal.attn_decode(*args, S=S, slen=slen))
+    finally:
+        metal.ATT_SHORT_MAX = old
+    assert mx.allclose(short, long, atol=1e-4).item()
+
+
 def test_cache_layout_one_entry_per_layer():
     m = _tiny_model()
     cache = m.make_cache()
