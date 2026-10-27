@@ -144,6 +144,65 @@ def _unpack_code(bits, n):
     )
 
 
+def _dot_split(fmt, name, K, gs, xexpr, tdim, rowvar, kvar, s):
+    """_dot_code in two parts, (load, compute): load reads the chunk of W (and its quantization
+    parameters) into registers suffixed with s, so it can be issued before x is ready."""
+    if fmt in ("bf16", "f16"):
+        vt = "bfloat4" if fmt == "bf16" else "half4"
+        load = (
+            f"const device {vt}* wp{s} = (const device {vt}*)({name} + (size_t){rowvar} * {K} + {kvar});"
+            f"const {vt} wa{s} = wp{s}[0], wb{s} = wp{s}[1];"
+        )
+        comp = (
+            f"{{ const float4 wv0 = float4(wa{s}), wv1 = float4(wb{s});"
+            f"for (int t = 0; t < {tdim}; ++t) acc[r][t] += dot(wv0, {xexpr('t', 0)}) + dot(wv1, {xexpr('t', 1)}); }}"
+        )
+        return load, comp
+    if fmt == "f32":
+        load = f"const float4 wv{s} = *(const device float4*)({name} + (size_t){rowvar} * {K} + {kvar});"
+        comp = f"for (int t = 0; t < {tdim}; ++t) acc[r][t] += dot(wv{s}, {xexpr('t', 0)});"
+        return load, comp
+    if fmt == "q8":
+        n = 16
+        wload = f"const uint4 q{s} = *(const device uint4*)({name} + (size_t){rowvar} * ({K} / 4) + {kvar} / 4);"
+        unpack = (
+            f"for (int j = 0; j < 4; ++j) {{ const uint u = q{s}[j]; "
+            "f[j] = float4(u & 0xffu, (u >> 8) & 0xffu, (u >> 16) & 0xffu, u >> 24); }"
+        )
+    elif fmt in ("q5", "q6"):
+        bits = int(fmt[1])
+        n = _chunk(fmt)
+        nw = n * bits // 32
+        wload = (
+            f"uint wq{s}[{nw}]; {{ const device uint* qp = (const device uint*)({name}) + (size_t){rowvar} * ({K} * {bits} / 32) + {kvar} * {bits} / 32;"
+            f"for (int i = 0; i < {nw}; ++i) wq{s}[i] = qp[i]; }}"
+        )
+        unpack = _unpack_code(bits, n).replace("wq[", f"wq{s}[")
+    elif fmt == "q4":
+        n = 16
+        wload = f"const uint2 q{s} = *(const device uint2*)({name} + (size_t){rowvar} * ({K} / 8) + {kvar} / 8);"
+        unpack = (
+            f"for (int j = 0; j < 2; ++j) {{ const uint u = q{s}[j]; "
+            "f[2*j] = float4(u & 0xfu, (u >> 4) & 0xfu, (u >> 8) & 0xfu, (u >> 12) & 0xfu); "
+            "f[2*j+1] = float4((u >> 16) & 0xfu, (u >> 20) & 0xfu, (u >> 24) & 0xfu, u >> 28); }"
+        )
+    else:
+        raise ValueError(fmt)
+    load = (
+        wload
+        + f"float sc{s}, bi{s}; {{ const size_t gi = (size_t){rowvar} * ({K} / {gs}) + {kvar} / {gs};"
+        f"sc{s} = float({name}_s[gi]); bi{s} = float({name}_b[gi]); }}"
+    )
+    nf = n // 4
+    comp = (
+        f"{{ float4 f[{nf}]; {unpack}"
+        f"for (int t = 0; t < {tdim}; ++t) {{ float s1 = 0, s2 = 0;"
+        f"  for (int j = 0; j < {nf}; ++j) {{ const float4 xv = {xexpr('t', 'j')}; s1 += dot(f[j], xv); s2 += xv.x + xv.y + xv.z + xv.w; }}"
+        f"  acc[r][t] += sc{s} * s1 + bi{s} * s2; }} }}"
+    )
+    return load, comp
+
+
 def _dot_code(fmt, name, K, gs, xexpr, tdim, rowvar, kvar):
     """Code accumulating acc[r][t] += dot(W[row, k:k+chunk], x[t, k:k+chunk]) for one 16-byte chunk.
     xexpr(t, j) must give a float4 of x for token t at k + 4*j."""
@@ -1681,6 +1740,31 @@ def _topk_code(top_k, scaling):
             if (lane == 0) for (int q = 0; q < TOPK; ++q) sel_p[q] = sel_p[q] / (psum + 1e-20f) * {scaling}f;"""
 
 
+def _topk_reg_code(top_k, scaling):
+    """_topk_code for every simdgroup, into registers: e_sel / p_sel of selection kk."""
+    return f"""
+            float sc[E / 32], sv[E / 32];
+            for (int j = 0; j < E / 32; ++j) {{
+                const int e = lane + 32 * j;
+                sv[j] = olala_sigmoid(logits[t * E + e]);
+                sc[j] = sv[j] + ebias[e];
+            }}
+            float psum = 0;
+            for (int q = 0; q < TOPK; ++q) {{
+                float best = -INFINITY; int bj = 0;
+                for (int j = 0; j < E / 32; ++j) if (sc[j] > best) {{ best = sc[j]; bj = j; }}
+                const float m = simd_max(best);
+                const int cand = (best == m) ? (lane + 32 * bj) : 0x7fffffff;
+                const int e = simd_min(cand);
+                float pv = 0;
+                if (e == lane + 32 * bj) {{ pv = sv[bj]; sc[bj] = -INFINITY; }}
+                pv = simd_sum(pv);
+                if (q == kk) {{ e_sel = e; p_sel = pv; }}
+                psum += pv;
+            }}
+            p_sel = p_sel / (psum + 1e-20f) * {scaling}f;"""
+
+
 # Routed-expert outputs: 1 = float atomics into one (T, D) buffer (fastest; the summation order
 # of the 72 partials per output varies between runs), 0 = per-threadgroup partials summed in a
 # fixed order by the next GEMV (bit-reproducible). OLALA_DETERMINISTIC=1 selects 0.
@@ -1692,6 +1776,7 @@ _MOE_ATOMIC = int(
 
 
 MOE_FB = 64  # expert hidden units per threadgroup in moe_fused
+_MOE_V3 = os.environ.get("OLALA_MOE_V3", "1") == "1"
 
 
 def moe_fused(logits, ebias, x0, x0_stride, wu: W, wd: W, top_k, scaling, T):
@@ -1712,7 +1797,103 @@ def moe_fused(logits, ebias, x0, x0_stride, wu: W, wd: W, top_k, scaling, T):
     )
     while LPRU > 1 and (D // chu) % LPRU:
         LPRU //= 2
-    key = ("moe_fused2", E, F, D, wu.key(), wd.key(), top_k, FB, NSG, x0_stride)
+    v3 = _MOE_V3 and D <= NT and T == 1  # (the redundant top-k cost more at T > 1)
+    key = ("moe_fused2", E, F, D, wu.key(), wd.key(), top_k, FB, NSG, x0_stride, v3)
+    if key not in _kernels and v3:
+        # every simdgroup selects the experts itself (no barrier), loads its rows of the
+        # down projection before phase 1, and phase 1 reads x0 from device memory
+
+        def xu(t, j):
+            # tok, not t: the dot-product code loops over its own t
+            return f"*(const device float4*)(x0 + tok * {x0_stride} + k + 4 * ({j}))"
+
+        def xd(t, j):
+            return f"*(const threadgroup float4*)(hs + (k - f0) + 4 * ({j}))"
+
+        dotu = _dot_code(wu.fmt, "wu", D, wu.gs or 0, xu, 1, "erow", "k").replace(
+            "acc[r][t]", "acc"
+        )
+        loads, comps = [], []
+        for c in range(FB // chd):
+            ld, cp = _dot_split(
+                wd.fmt,
+                "wd",
+                F,
+                wd.gs or 0,
+                xd,
+                1,
+                "erow2",
+                f"(f0 + {c * chd})",
+                f"_{c}",
+            )
+            loads.append(ld)
+            comps.append(
+                f"{{ const int k = f0 + {c * chd}; "
+                + cp.replace("acc[r][t]", "acc")
+                + " }"
+            )
+        src = f"""
+        constexpr int E = {E}, F = {F}, D = {D}, TOPK = {top_k}, FB = {FB}, NB = {
+            NB
+        }, NT = {NT}, LPRU = {LPRU};
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint sg = tid / 32, lane = tid % 32;
+        const uint blk = threadgroup_position_in_grid.x;
+        const int t = blk / (TOPK * NB);
+        const int kk = (blk / NB) % TOPK;
+        const int fb = blk % NB;
+        const int f0 = fb * FB;
+        const int tok = t;
+        threadgroup float hs[FB];
+        int e_sel = 0;
+        float p_sel = 0;
+        {{
+            {_topk_reg_code(top_k, scaling)}
+        }}
+        const int e = e_sel;
+        const float pk = p_sel;
+        // phase 2 rows: output o = tid of this block's FB hidden units
+        const int erow2 = e * D + min((int)tid, D - 1);
+        {chr(10).join(loads)}
+        // phase 1: hidden unit f = tid / LPRU, LPRU lanes split D
+        {{
+            const int f = tid / LPRU, sl = tid % LPRU;
+            float acc = 0;
+            if (f < FB) {{
+                const int erow = e * F + f0 + f;
+                for (int k = sl * {chu}; k < D; k += LPRU * {chu}) {{
+                    {dotu}
+                }}
+            }}
+            for (int o = LPRU / 2; o > 0; o /= 2) acc += simd_shuffle_xor(acc, o);
+            if (sl == 0 && f < FB) {{ const float u = max(acc, 0.0f); hs[f] = u * u * pk; }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((int)tid < D) {{
+            const int o = tid;
+            float acc = 0;
+            {chr(10).join(comps)}
+            {
+            "atomic_fetch_add_explicit(&parts[(size_t)t * D + o], acc, memory_order_relaxed);"
+            if _MOE_ATOMIC
+            else "parts[((size_t)t * TOPK * NB + kk * NB + fb) * D + o] = acc;"
+        }
+        }}
+        """
+        names = (
+            ["logits", "ebias", "x0", "wu"]
+            + (["wu_s", "wu_b"] if wu.fmt.startswith("q") else [])
+            + ["wd"]
+            + (["wd_s", "wd_b"] if wd.fmt.startswith("q") else [])
+        )
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"olala_moe_fused3_{abs(hash(key)) % 10**12}a{_MOE_ATOMIC}",
+            input_names=names,
+            output_names=["parts"],
+            source=src,
+            header=_HDR,
+            atomic_outputs=bool(_MOE_ATOMIC),
+        )
     if key not in _kernels:
 
         def xu(t, j):

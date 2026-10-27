@@ -178,6 +178,30 @@ def test_attn_decode_short_matches_long(S, kstart):
     assert mx.allclose(short, long, atol=1e-4).item()
 
 
+@pytest.mark.parametrize("T", [1, 3])
+def test_moe_fused_matches_reference(T):
+    from mlx_engine.models.olala import kernels
+
+    m = _tiny_model().layers[0].mlp
+    E, D = m.n_experts, m.d_latent
+    # larger expert weights than _tiny_model's, so that every routed row matters
+    m.experts.experts.weight = mx.random.normal(m.experts.experts.weight.shape) * 0.3
+    m.experts.output_experts.weight = (
+        mx.random.normal(m.experts.output_experts.weight.shape) * 0.3
+    )
+    logits = mx.random.normal((T, E))
+    x0 = mx.random.normal((T, D))
+    inds, probs = kernels.moe_route(logits, m.expert_bias, m.top_k, m.scaling)
+    ref = kernels.moe_experts(x0, inds, probs, m.experts)
+    wu, wd = metal.W(m.experts.experts), metal.W(m.experts.output_experts)
+    out = metal.moe_fused(
+        logits, m.expert_bias.astype(mx.float32), x0, D, wu, wd, m.top_k, m.scaling, T
+    )
+    if out.ndim == 3:  # per-threadgroup partials (deterministic mode)
+        out = out.sum(axis=1)
+    assert mx.allclose(out, ref, rtol=1e-4, atol=1e-4).item(), mx.abs(out - ref).max()
+
+
 def test_cache_layout_one_entry_per_layer():
     m = _tiny_model()
     cache = m.make_cache()
