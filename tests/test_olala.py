@@ -299,3 +299,62 @@ def test_fused_decode_quantized(monkeypatch, bits):
     assert mx.allclose(ref, fused, atol=5e-3, rtol=5e-3).item(), (
         mx.abs(ref - fused).max().item()
     )
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_factored_cache_matches_full(monkeypatch, batch):
+    """Factored (TPA) KV cache: prefill in chunks then decode, against the full cache (reference path)."""
+    monkeypatch.setenv("OLALA_FUSED", "0")
+    m = _tiny_model()
+    prompt = mx.random.randint(0, TINY["vocab_size"], (batch, 45))
+    out = {}
+    for layout in ("full", "factored"):
+        monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+        cache = m.make_cache()
+        logits = [m(prompt[:, s : s + 16], cache=cache).astype(mx.float32) for s in range(0, 45, 16)]
+        tok = prompt[:, :1]
+        for i in range(6):
+            logits.append(m(tok, cache=cache).astype(mx.float32))
+            tok = prompt[:, i + 1 : i + 2]
+        out[layout] = mx.concatenate(logits, axis=1)
+    assert mx.allclose(out["full"], out["factored"], atol=1e-4).item(), (
+        mx.abs(out["full"] - out["factored"]).max().item()
+    )
+
+
+def test_tpa_decode_matches_attn_decode():
+    """tpa_decode (factored cache, Metal 4 tensor API) against attn_decode over the expanded K / V (Olala dims)."""
+    Hq, Hk, Dh, R, T, S = 48, 12, 128, 4, 2, 1500
+    mx.random.seed(0)
+    cap = S + 64
+    rows_k = (mx.random.normal((T, cap, R, Dh)) * 0.5).astype(mx.bfloat16)
+    rows_v = (mx.random.normal((T, cap, R, Dh)) * 0.5).astype(mx.bfloat16)
+    coef_k = mx.random.normal((T, cap, Hk, 2 * R)) * 0.6
+    coef_v = mx.random.normal((T, cap, Hk, 2 * R)) * 0.3
+    coef_k[:, 0, :, R:] = 0
+    coef_v[:, 0, :, R:] = 0
+
+    def expand(rows, coef):
+        r = rows[:, :S].astype(mx.float32)
+        rp = mx.concatenate([mx.zeros_like(r[:, :1]), r[:, :-1]], axis=1)
+        return (coef[:, :S] @ mx.concatenate([r, rp], axis=2)).transpose(0, 2, 1, 3)
+
+    q = mx.random.normal((T, Hq, Dh)).astype(mx.bfloat16)
+    kstart = mx.array([0, S // 3], dtype=mx.int32)
+    slen = mx.array([S], dtype=mx.int32)
+
+    def merge(o, m_, l_):
+        M = m_.max(axis=-1, keepdims=True)
+        c = mx.where(m_ == -mx.inf, 0.0, mx.exp(m_ - M))
+        return (o * c[..., None]).sum(-2) / (l_ * c).sum(-1)[..., None]
+
+    ref = merge(*metal.attn_decode(q.astype(mx.float32), expand(rows_k, coef_k), expand(rows_v, coef_v),
+                                   kstart, 1 / 128, 150.0, T, Hq, Hk, Dh, S=S, slen=slen))
+    try:
+        got = merge(*metal.tpa_decode(q, rows_k, rows_v, coef_k, coef_v, kstart, slen, S, 1 / 128, 150.0,
+                                      T, Hq, Hk, Dh, R))
+        mx.eval(got)
+    except RuntimeError as e:  # no Metal 4 tensor API (pre-M5 GPU / older OS)
+        pytest.skip(str(e).splitlines()[0])
+    err = (mx.abs(got - ref).max() / mx.abs(ref).max()).item()
+    assert err < 2e-3, err

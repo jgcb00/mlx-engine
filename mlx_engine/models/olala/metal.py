@@ -15,6 +15,7 @@ sub-layer runs as the prologue of the next matrix-vector product ("geo").
 
 import math
 import os
+import re
 
 import mlx.core as mx
 from mlx import nn
@@ -2119,6 +2120,251 @@ def v_prep(
     )
 
 
+def v_prep_factored(big, small, kprev, vprev, akprev, avprev, prm, pos, Hq, Hk, Dh, Rk, n_noise, window, T,
+                    rows_k, rows_v, coef_k, coef_v, wpos):
+    """v_prep for the factored cache (model.FactoredKVCache): q (T,Hq,Dh) in the rows dtype, and the new token's
+    factors written in place at position wpos[t]: rows B_k * k_norm / B_v (R,Dh), coefficients (Hk,2R) with the
+    k-norm scale of the shifted key folded in. Also returns the raw k / v (T,1,Hk,Dh) f32 and the raw a_k / a_v
+    (T,1,Hk,R) f32 for the next token shift."""
+    key = ("v_prep_fac", Hq, Hk, Dh, Rk, n_noise, str(rows_k.dtype))
+    if key not in _kernels:
+        ot = {mx.bfloat16: "bfloat", mx.float16: "half", mx.float32: "float"}[rows_k.dtype]
+        nbig = Hq * Dh + 2 * Rk * Dh + (Hq - Hk) * Dh
+        nsmall = 2 * Hk * Rk + 2 * Hk + n_noise
+        src = f"""
+        constexpr int Hq = {Hq}, Hk = {Hk}, Dh = {Dh}, Rk = {Rk};
+        constexpr int NB = {nbig}, NSM = {nsmall};
+        const uint tid = thread_position_in_threadgroup.x;   // Dh threads
+        const uint sg = tid / 32, lane = tid % 32;
+        const uint blk = threadgroup_position_in_grid.x;
+        const int t = blk / (Hq + Hk);
+        const int hh = blk % (Hq + Hk);
+        const int cap = rows_k_shape[1];
+        const size_t cell = (size_t)t * cap + wpos[t];
+        const device float* bg = big + (size_t)t * NB;
+        const device float* sm = small + (size_t)t * NSM;
+        const float p = float(pos[t]);
+        threadgroup float red[Dh / 32];
+        float val, ak = 0, av = 0;
+        int h = 0;
+        if (hh < Hq) {{
+            val = bg[hh * Dh + tid];
+        }} else {{
+            h = hh - Hq;
+            const device float* bk = bg + Hq * Dh;            // W_B_k (Rk, Dh)
+            const device float* bv = bk + Rk * Dh;            // W_B_v
+            float kr = 0, vr = 0;
+            for (int r = 0; r < Rk; ++r) {{
+                kr += sm[h * Rk + r] * bk[r * Dh + tid];
+                vr += sm[Hk * Rk + h * Rk + r] * bv[r * Dh + tid];
+            }}
+            kr /= Rk; vr /= Rk;
+            ak = olala_sigmoid(sm[2 * Hk * Rk + h]);
+            av = olala_sigmoid(sm[2 * Hk * Rk + Hk + h]);
+            if (p <= 0.0f) {{ ak = 0; av = 0; }}
+            const float kp = kprev[((size_t)t * Hk + h) * Dh + tid];
+            kraw_out[((size_t)t * Hk + h) * Dh + tid] = kr;
+            vraw_out[((size_t)t * Hk + h) * Dh + tid] = vr;
+            val = ak * kp + (1 - ak) * kr;
+            if (h == 0) {{
+                // the token's rank rows, shared by the kv heads
+                for (int r = 0; r < Rk; ++r) {{
+                    ((device {ot}*)rows_k)[(cell * Rk + r) * Dh + tid] = ({ot})(bk[r * Dh + tid] * kn[tid]);
+                    ((device {ot}*)rows_v)[(cell * Rk + r) * Dh + tid] = ({ot})(bv[r * Dh + tid]);
+                }}
+            }}
+        }}
+        float s = simd_sum(val * val);
+        if (lane == 0) red[sg] = s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        s = 0;
+        for (int i = 0; i < Dh / 32; ++i) s += red[i];
+        const float rn = rsqrt(s / Dh + {1e-6}f);
+        if (hh < Hq) {{
+            const float lp = log(min(p + 1.0f, {float(window)}f));
+            q_out[((size_t)t * Hq + hh) * Dh + tid] = ({ot})(val * rn * qn[tid] * scaler[hh] * lp);
+        }} else if (tid < Rk) {{
+            const int r = tid;
+            const size_t ci = (cell * Hk + h) * 2 * Rk;
+            const float akr = sm[h * Rk + r], avr = sm[Hk * Rk + h * Rk + r];
+            ((device float*)coef_k)[ci + r] = rn * (1 - ak) * akr / Rk;
+            ((device float*)coef_k)[ci + Rk + r] = rn * ak * akprev[((size_t)t * Hk + h) * Rk + r] / Rk;
+            ((device float*)coef_v)[ci + r] = (1 - av) * avr / Rk;
+            ((device float*)coef_v)[ci + Rk + r] = av * avprev[((size_t)t * Hk + h) * Rk + r] / Rk;
+            akraw_out[((size_t)t * Hk + h) * Rk + r] = akr;
+            avraw_out[((size_t)t * Hk + h) * Rk + r] = avr;
+        }}
+        """
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"olala_v_prep_fac_{abs(hash(key)) % 10**12}",
+            input_names=["big", "small", "kprev", "vprev", "akprev", "avprev", "qn", "kn", "scaler", "pos",
+                         "rows_k", "rows_v", "coef_k", "coef_v", "wpos"],
+            output_names=["q_out", "kraw_out", "vraw_out", "akraw_out", "avraw_out"],
+            source=src,
+            header=_HDR,
+        )
+    return _kernels[key](
+        inputs=[big, small, kprev, vprev, akprev, avprev, prm["q_norm"], prm["k_norm"], prm["scaler"], pos,
+                rows_k, rows_v, coef_k, coef_v, wpos],
+        grid=(T * (Hq + Hk) * Dh, 1, 1),
+        threadgroup=(Dh, 1, 1),
+        output_shapes=[(T, Hq, Dh), (T, 1, Hk, Dh), (T, 1, Hk, Dh), (T, 1, Hk, Rk), (T, 1, Hk, Rk)],
+        output_dtypes=[rows_k.dtype, mx.float32, mx.float32, mx.float32, mx.float32],
+    )
+
+
+TPA_NKB = int(os.environ.get("OLALA_TPA_NKB", "32"))  # keys per sub-block of the factored decode attention (incl. the overlap key)
+TPA_BLK = int(os.environ.get("OLALA_TPA_BLK", "0"))  # keys per threadgroup (0: from TPA_TGS)
+TPA_TGS = int(os.environ.get("OLALA_TPA_TGS", "40"))  # threadgroups aimed at per decode step (one per core, 40-core GPU)
+TPA_BLK_MAX = 17 * 31  # keys per threadgroup at most (measured best at long contexts, M5 Max)
+TPA_WAVE = 2 * TPA_TGS  # threadgroups resident at once (two per core): long contexts fill whole waves
+TPA_NSG = 12
+
+_TENSOR_HDR = """
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+"""
+
+
+def has_tensor() -> bool:
+    """GPU with matrix units for the Metal 4 tensor API (M5 / A19: applegpu_g17 and later)."""
+    if "has_tensor" not in _kernels:
+        m = re.match(r"applegpu_g(\d+)", mx.device_info().get("architecture", ""))
+        _kernels["has_tensor"] = bool(m) and int(m.group(1)) >= 17
+    return _kernels["has_tensor"]
+
+
+def tpa_decode(q, rows_k, rows_v, coef_k, coef_v, kstart, slen, S, scale, softcap, T, Hq, Hk, Dh, Rk):
+    """Decode attention over the factored cache with the Metal 4 tensor API (matrix units of M5 / A19 GPUs).
+    All Hq heads attend to the Rk rank rows of each key ("MQA on rank rows"):
+        Z = Q B_k^T, score[h,s] = sum_r c[s,j,r] Z[h,(s,r)] + c_prev[s,j,r] Z[h,(s-1,r)]
+        O += W B_v,  W[h,(u,r)] = p[h,u] cv[u,j,r] + p[h,u+1] cv_prev[u+1,j,r]          (j = kv head of h)
+    in sub-blocks of TPA_NKB keys, the first one overlapping the previous sub-block (token shift); both products
+    are mpp::tensor_ops::matmul2d (Q and the rows in the rows dtype, Z / W f32), O in a cooperative tensor.
+    q (T,Hq,Dh) in the rows dtype; rows (T,cap,Rk,Dh), coefs (T,cap,Hk,2Rk) f32, cap >= S + TPA_NKB.
+    Returns partial o (T,Hq,NS,Dh), m, l (T,Hq,NS) like attn_decode."""
+    NKB, BLK, NSG = TPA_NKB, TPA_BLK, TPA_NSG
+    RW = NKB * Rk
+    G = Hq // Hk
+    assert Hq * 8 == NSG * 32 and NKB % 8 == 0  # 8 softmax lanes per head
+    if BLK <= 0:
+        # enough threadgroups to fill the GPU, keys per threadgroup a multiple of the sub-block advance
+        adv = NKB - 1
+        BLK = min(max(adv, -(-S * T // TPA_TGS) // adv * adv), TPA_BLK_MAX)
+        if BLK == TPA_BLK_MAX:
+            # capped: whole waves of TPA_WAVE threadgroups (94 threadgroups at 48k keys ran 13 % slower than 159)
+            waves = -(-S * T // (TPA_WAVE * TPA_BLK_MAX))
+            BLK = -(-(-(-S * T // (TPA_WAVE * waves))) // adv) * adv
+    key = ("tpa_dec", Hq, Hk, Dh, Rk, str(rows_k.dtype), float(scale), float(softcap), NKB)
+    if key not in _kernels:
+        ot = {mx.bfloat16: "bfloat", mx.float16: "half"}[rows_k.dtype]
+        cap_code = f"v = tanh(v / {float(softcap)}f) * {float(softcap)}f;" if softcap else ""
+        src = f"""
+        constexpr int Hq = {Hq}, Hk = {Hk}, Dh = {Dh}, G = {G}, R = {Rk}, NKB = {NKB}, RW = {RW};
+        const int BLK = blkp[0];
+        constexpr int RWP = RW + 4, NL = NKB / 8;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint blk = threadgroup_position_in_grid.x;
+        const int S = slen[0], SP = rows_k_shape[1];
+        const int NS = (S + BLK - 1) / BLK;
+        const int t = blk / NS, sp = blk % NS;
+        const int j0 = max(sp * BLK, kstart[t]), j1 = min((sp + 1) * BLK, S);
+        threadgroup float ZW[Hq * RWP];
+        threadgroup float Cs[Hq];
+        const device {ot}* kB = rows_k + (size_t)t * SP * R * Dh;
+        const device {ot}* vB = rows_v + (size_t)t * SP * R * Dh;
+        const device float* kC = coef_k + (size_t)t * SP * Hk * 2 * R;
+        const device float* vC = coef_v + (size_t)t * SP * Hk * 2 * R;
+
+        auto tQ = tensor<device {ot}, dextents<int32_t, 2>, tensor_inline>((device {ot}*)q + (size_t)t * Hq * Dh, dextents<int32_t, 2>(Dh, Hq));
+        auto tZ = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(ZW, dextents<int32_t, 2>(RW, Hq), array<int, 2>({{1, RWP}}));
+        matmul2d<matmul2d_descriptor(Hq, RW, Dh, false, true, false, matmul2d_descriptor::mode::multiply), execution_simdgroups<{NSG}>> mm_qk;
+        matmul2d<matmul2d_descriptor(Hq, Dh, RW, false, false, false, matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<{NSG}>> mm_pv;
+        auto tV0 = tensor<device {ot}, dextents<int32_t, 2>, tensor_inline>((device {ot}*)vB, dextents<int32_t, 2>(Dh, RW));
+        auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tZ), decltype(tV0), float>();
+        for (short i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] = 0.0f;
+
+        // softmax: 8 lanes per head (thread = (head, keys sk, sk + 8, ...) of the sub-block)
+        const int sh = tid / 8, sk = tid % 8;
+        const int hj = sh / G;
+        float m = -INFINITY, l = 0;
+
+        for (int f = j0, u0 = 0; f < j1; f = u0 + NKB) {{
+            u0 = f > 0 ? f - 1 : 0;                       // first key of the sub-block (overlap, unless f == 0)
+            {{
+                auto tK = tensor<device {ot}, dextents<int32_t, 2>, tensor_inline>((device {ot}*)kB + (size_t)u0 * R * Dh, dextents<int32_t, 2>(Dh, RW));
+                mm_qk.run(tQ, tK, tZ);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float sc[NL];
+            float mx_ = -INFINITY;
+            for (int i = 0; i < NL; ++i) {{
+                const int s = sk + 8 * i, u = u0 + s;
+                float v = -INFINITY;
+                if (u >= f && u < j1) {{
+                    const device float4* c = (const device float4*)(kC + ((size_t)u * Hk + hj) * 2 * R);
+                    const float4 cc = c[0], cp = c[1];
+                    const float4 zc = *(threadgroup float4*)&ZW[sh * RWP + s * R];
+                    const float4 zp = s > 0 ? *(threadgroup float4*)&ZW[sh * RWP + (s - 1) * R] : 0.0f;
+                    v = (dot(cc, zc) + dot(cp, zp)) * {float(scale)}f;
+                    {cap_code}
+                }}
+                sc[i] = v;
+                mx_ = max(mx_, v);
+            }}
+            mx_ = max(mx_, simd_shuffle_xor(mx_, 1)); mx_ = max(mx_, simd_shuffle_xor(mx_, 2)); mx_ = max(mx_, simd_shuffle_xor(mx_, 4));
+            const float mn = max(m, mx_);
+            const float corr = mn == -INFINITY ? 1.0f : exp(m - mn);
+            float p[NL], ps = 0;
+            for (int i = 0; i < NL; ++i) {{ p[i] = sc[i] == -INFINITY ? 0.0f : exp(sc[i] - mn); ps += p[i]; }}
+            ps += simd_shuffle_xor(ps, 1); ps += simd_shuffle_xor(ps, 2); ps += simd_shuffle_xor(ps, 4);
+            l = l * corr + ps; m = mn;
+            float4 w[NL];
+            for (int i = 0; i < NL; ++i) {{
+                const int s = sk + 8 * i, u = u0 + s;
+                // p of the next key: lane sk + 1, or the next i for sk == 7
+                float pn = simd_shuffle_down(p[i], 1);
+                if (sk == 7) pn = i + 1 < NL ? simd_shuffle_up(p[min(i + 1, NL - 1)], 7) : 0.0f;
+                w[i] = 0;
+                if (u < j1) {{
+                    w[i] = p[i] * ((const device float4*)(vC + ((size_t)u * Hk + hj) * 2 * R))[0];
+                    if (s + 1 < NKB && u + 1 < j1) w[i] += pn * ((const device float4*)(vC + ((size_t)(u + 1) * Hk + hj) * 2 * R))[1];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);   // every Z read done: W overwrites it
+            if (sk == 0) Cs[sh] = corr;
+            for (int i = 0; i < NL; ++i) *(threadgroup float4*)&ZW[sh * RWP + (sk + 8 * i) * R] = w[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] *= Cs[co.get_multidimensional_index(i)[1]];
+            {{
+                auto tV = tensor<device {ot}, dextents<int32_t, 2>, tensor_inline>((device {ot}*)vB + (size_t)u0 * R * Dh, dextents<int32_t, 2>(Dh, RW));
+                mm_pv.run(tZ, tV, co);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        const size_t ob = (size_t)t * Hq * NS;
+        auto tO = tensor<device float, dextents<int32_t, 2>, tensor_inline>(o_out + (ob + sp) * Dh, dextents<int32_t, 2>(Dh, Hq), array<int, 2>({{1, NS * Dh}}));
+        co.store(tO);
+        if (sk == 0) {{ m_out[ob + (size_t)sh * NS + sp] = m; l_out[ob + (size_t)sh * NS + sp] = l; }}
+        """
+        _kernels[key] = mx.fast.metal_kernel(
+            name=f"olala_tpa_dec_{abs(hash(key)) % 10**12}",
+            input_names=["q", "rows_k", "rows_v", "coef_k", "coef_v", "kstart", "slen", "blkp"],
+            output_names=["o_out", "m_out", "l_out"],
+            source=src,
+            header=_HDR + _TENSOR_HDR,
+        )
+    NS = (S + BLK - 1) // BLK
+    return _kernels[key](
+        inputs=[q, rows_k, rows_v, coef_k, coef_v, kstart, slen, mx.array([BLK], dtype=mx.int32)],
+        grid=(T * NS * NSG * 32, 1, 1),
+        threadgroup=(NSG * 32, 1, 1),
+        output_shapes=[(T, Hq, NS, Dh), (T, Hq, NS), (T, Hq, NS)],
+        output_dtypes=[mx.float32] * 3,
+    )
+
+
 ATT_NW = 4  # simdgroups per attention threadgroup
 
 
@@ -2807,8 +3053,10 @@ def can_decode(model, x, cache, ssm_mask) -> bool:
         if c is None or not hasattr(c, "caches"):
             return False
         c = c.caches[0]
-        if type(c).__name__ not in ("KVCache", "BatchKVCache") or c.keys is None:
+        if type(c).__name__ not in ("KVCache", "BatchKVCache", "FactoredKVCache") or c.keys is None:
             return False
+        if type(c).__name__ == "FactoredKVCache" and (model.layers[i].mixer.n_heads * 8 != TPA_NSG * 32 or not has_tensor()):
+            return False  # tpa_decode: 8 softmax lanes per head in 12 simdgroups (Olala: 48 heads), matrix units
     for i in model.ssm_idx:
         c = cache[i]
         if c[0] is None or getattr(c, "lengths", None) is not None:
@@ -2973,6 +3221,8 @@ def _v_layer(L, resid, g, prev_geo, prev_li, cache, pos, T, D, shared, gst=None)
     att = L["attn"]
     Hq, Hk, Dh, Rk = att.n_heads, att.n_kv, att.head_dim, att.rank
     kc, sc = cache.caches[0], cache.caches[1]
+    if type(kc).__name__ == "FactoredKVCache":
+        return _v_layer_factored(L, att, kc, sc, big, small, resid, pos, T, D, shared)
     kv_dtype = kc.keys.dtype
     if sc[0] is None:
         kprev = vprev = mx.zeros((T, 1, Hk, Dh), mx.float32)
@@ -3054,17 +3304,52 @@ def _v_layer(L, resid, g, prev_geo, prev_li, cache, pos, T, D, shared, gst=None)
 _warmup_started = set()
 
 
+def _v_layer_factored(L, att, kc, sc, big, small, resid, pos, T, D, shared):
+    """_v_layer over model.FactoredKVCache: factors written in place, tensor-API attention (tpa_decode)."""
+    Hq, Hk, Dh, Rk = att.n_heads, att.n_kv, att.head_dim, att.rank
+    if sc[0] is None:
+        kprev = vprev = mx.zeros((T, 1, Hk, Dh), mx.float32)
+        akprev = avprev = mx.zeros((T, 1, Hk, Rk), mx.float32)
+    else:
+        kprev, vprev = sc[0].astype(mx.float32), sc[1].astype(mx.float32)
+        akprev, avprev = sc[2].astype(mx.float32), sc[3].astype(mx.float32)
+    kc.ensure_inplace(1)
+    if shared.get("wpos_off") != kc.offset:
+        shared["wpos_off"] = kc.offset
+        shared["wpos"] = mx.full((T,), kc.offset, dtype=mx.int32)
+    q, kraw, vraw, akraw, avraw = v_prep_factored(
+        big, small, kprev, vprev, akprev, avprev, L["prm"], pos, Hq, Hk, Dh, Rk, att.n_noise, att.window, T,
+        kc.rows_k, kc.rows_v, kc.coef_k, kc.coef_v, shared["wpos"],
+    )
+    kc.commit_inplace(1)
+    sc[0], sc[1], sc[2], sc[3] = kraw, vraw, akraw, avraw
+    S_len = kc.offset
+    if "kstart" not in shared:
+        ks = max(S_len - 1 - att.window, 0)
+        shared["kstart"] = mx.full((T,), ks).astype(mx.int32)
+        shared["slen"] = mx.array([S_len], dtype=mx.int32)
+    o, m, l = tpa_decode(
+        q, kc.rows_k, kc.rows_v, kc.coef_k, kc.coef_v, shared["kstart"], shared["slen"], S_len,
+        att.scale, att.softcap, T, Hq, Hk, Dh, Rk,
+    )
+    ymix = attn_combine(
+        o, m, l, small, big, Hq, Hk, Dh, att.snr, att.n_noise, att.gate_bias, T,
+        small_off=2 * Hk * Rk + 2 * Hk, big_off=Hq * Dh + 2 * Rk * Dh,
+    )
+    if _GEO_STATS:
+        gmix, gmst = gemv([ymix], [L["mixer_proj"]], T=T, stats_x=resid)
+    else:
+        gmix, gmst = gemv([ymix], [L["mixer_proj"]], T=T)[0], None
+    resid, g, gst = _moe_block(L, resid, gmix, T, D, gst=gmst)
+    return resid, g, gst
+
+
 def _warmup(model, head_fn, rows):
     """Compile the decode kernels of the given batch sizes (throwaway caches)."""
-    from .model import ArraysCache, CacheList, KVCache
+    from .model import make_cache
 
     for T in rows:
-        cache = [
-            ArraysCache(1)
-            if layer.layer_type == "M"
-            else CacheList(KVCache(), ArraysCache(2))
-            for layer in model.layers
-        ]
+        cache = make_cache(model.layers)
         tok = mx.zeros((T, 2), dtype=mx.int32)
         mx.eval(model(tok, cache=cache))
         out = model(tok[:, :1], cache=cache)
@@ -3073,7 +3358,7 @@ def _warmup(model, head_fn, rows):
         mx.eval(out)
     # the long-context attention kernel too: its first use would stall generation
     for layer, c in zip(model.layers, cache):
-        if layer.layer_type == "V":
+        if layer.layer_type == "V" and type(c[0]).__name__ != "FactoredKVCache":
             att, kc = layer.mixer, c[0]
             Hq, Hk, Dh, S = att.n_heads, att.n_kv, att.head_dim, ATT_SHORT_MAX + 1
             kv = mx.zeros((1, Hk, S, Dh), dtype=kc.keys.dtype)

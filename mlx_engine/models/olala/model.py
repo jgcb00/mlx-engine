@@ -42,6 +42,11 @@ from . import kernels
 # compute every matmul input in f32 (slow with bf16 weights; for accuracy checks)
 _ACT_F32 = os.environ.get("OLALA_ACT_F32", "0") == "1"
 _M3_CHUNKED = os.environ.get("OLALA_M3_CHUNKED", "1") == "1"
+# KV cache layout of the attention layers: "full" (expanded K / V) or "factored" (TPA factors: the rank rows
+# B_k * k_norm and B_v of each token plus per-kv-head coefficients, ~2.2x less memory). Factored decoding is fused
+# only on GPUs with matrix units (M5 / A19, metal.tpa_decode); elsewhere it expands the cache every step. Full
+# stays the default: the factored cache is not wired into batched serving (BatchKVCache).
+_TPA_CACHE = os.environ.get("OLALA_TPA_CACHE", "full")
 
 
 @dataclass
@@ -158,6 +163,143 @@ class InplaceAppendMixin:
 
 class KVCache(InplaceAppendMixin, _MlxKVCache):
     """mlx-lm KVCache with in-place appends for the fused decode path."""
+
+
+class FactoredKVCache(_MlxKVCache):
+    """Factored (TPA) KV cache of one attention layer. Per token s and kv head j:
+        k_s[j] = sum_r ck[s, j, r] Bk_s[r] + ck[s, j, R + r] Bk_{s-1}[r]   (token shift, k-norm folded in)
+        v_s[j] = sum_r cv[s, j, r] Bv_s[r] + cv[s, j, R + r] Bv_{s-1}[r]
+    rows_k / rows_v (B, cap, R, Dh) in the compute dtype (Bk already multiplied by the k-norm weight),
+    coef_k / coef_v (B, cap, Hk, 2R) f32. The capacity always keeps PAD rows past ``offset``: the decode
+    kernel reads whole windows of keys. In-place appends follow InplaceAppendMixin (high-water mark)."""
+
+    PAD = 64
+
+    def __init__(self):
+        super().__init__()
+        self.rows_k = self.rows_v = self.coef_k = self.coef_v = None
+        self._hw = 0
+
+    @property
+    def cap(self):
+        return 0 if self.rows_k is None else self.rows_k.shape[1]
+
+    def _grow(self, need, like_rows, like_coef):
+        if self.rows_k is not None and need + self.PAD <= self.cap:
+            return
+        B, _, R, Dh = like_rows.shape
+        Hk = like_coef.shape[2]
+        n = ((need + self.PAD + self.step - 1) // self.step) * self.step
+        new = [
+            mx.zeros((B, n, R, Dh), like_rows.dtype),
+            mx.zeros((B, n, R, Dh), like_rows.dtype),
+            mx.zeros((B, n, Hk, 2 * R), mx.float32),
+            mx.zeros((B, n, Hk, 2 * R), mx.float32),
+        ]
+        if self.rows_k is not None and self.offset > 0:
+            o = self.offset
+            for i, a in enumerate((self.rows_k, self.rows_v, self.coef_k, self.coef_v)):
+                new[i][:, :o] = a[:, :o]
+        self.rows_k, self.rows_v, self.coef_k, self.coef_v = new
+
+    def append(self, fk, fv, ck, cv):
+        """fk / fv (B, L, R, Dh), ck / cv (B, L, Hk, 2R): factors of L new tokens."""
+        L = fk.shape[1]
+        self._grow(self.offset + L, fk, ck)
+        o = self.offset
+        self.rows_k[:, o : o + L] = fk
+        self.rows_v[:, o : o + L] = fv
+        self.coef_k[:, o : o + L] = ck
+        self.coef_v[:, o : o + L] = cv
+        self.offset += L
+        self._hw = self.offset
+
+    def expand(self, dtype):
+        """K / V of the cached tokens (B, Hk, S, Dh) in ``dtype`` (for the prefill attention)."""
+        S = self.offset
+
+        def ex(rows, coef):
+            r = rows[:, :S].astype(mx.float32)
+            rp = mx.concatenate([mx.zeros_like(r[:, :1]), r[:, :-1]], axis=1)
+            return (coef[:, :S] @ mx.concatenate([r, rp], axis=2)).transpose(0, 2, 1, 3).astype(dtype)
+
+        return ex(self.rows_k, self.coef_k), ex(self.rows_v, self.coef_v)
+
+    # mlx-lm KVCache interface: ``keys`` is only used as "not empty" / dtype marker
+    @property
+    def keys(self):
+        return self.rows_k
+
+    @keys.setter
+    def keys(self, v):
+        pass
+
+    @property
+    def values(self):
+        return self.rows_v
+
+    @values.setter
+    def values(self, v):
+        pass
+
+    @property
+    def state(self):
+        o = self.offset
+        return self.rows_k[:, :o], self.rows_v[:, :o], self.coef_k[:, :o], self.coef_v[:, :o]
+
+    @state.setter
+    def state(self, v):
+        self.rows_k, self.rows_v, self.coef_k, self.coef_v = v
+        self.offset = self.rows_k.shape[1]
+        self._hw = self.offset  # restored buffers may be shared: no in-place append until regrown
+
+    def update_and_fetch(self, keys, values):
+        raise NotImplementedError("FactoredKVCache: use append() / expand()")
+
+    def can_append_inplace(self, n: int = 1) -> bool:
+        return (
+            self.rows_k is not None
+            and self.offset >= self._hw
+            and self.offset + n + self.PAD <= self.cap
+        )
+
+    def ensure_inplace(self, n: int = 1):
+        """Regrow (fresh buffers, copied) when the next n appends cannot be done in place."""
+        if self.rows_k is not None and not self.can_append_inplace(n):
+            self._grow_copy(self.offset + n)
+
+    def _grow_copy(self, need):
+        old = (self.rows_k, self.rows_v, self.coef_k, self.coef_v)
+        B = old[0].shape[0]
+        n = ((need + self.PAD + self.step - 1) // self.step) * self.step
+        o = self.offset
+        new = [mx.zeros((B, n) + a.shape[2:], a.dtype) for a in old]
+        for i, a in enumerate(old):
+            new[i][:, :o] = a[:, :o]
+        self.rows_k, self.rows_v, self.coef_k, self.coef_v = new
+        self._hw = o
+
+    def commit_inplace(self, n: int = 1):
+        self.offset += n
+        self._hw = self.offset
+
+    def __copy__(self):
+        return self._shared_copy()
+
+    def __deepcopy__(self, memo):
+        return self._shared_copy()
+
+    def _shared_copy(self):
+        c = self.__class__.__new__(self.__class__)
+        c.__dict__.update(self.__dict__)
+        if self.rows_k is not None:
+            self._hw = c._hw = self.cap
+        return c
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
 
 
 class AttnCacheMixin:
@@ -380,9 +522,10 @@ class DiffTPAttention(nn.Module):
         self.k_norm = _Norm(Dh)
         self.softmax_scaler = mx.ones((Hq,))
 
-    def project(self, h):
+    def project(self, h, factors=False):
         """Returns q (B,L,Hq,Dh), k_raw / v_raw (B,L,Hk,Dh), alpha_k / alpha_v (B,L,Hk,1),
-        lambda (B,L,Hn,1,1), gate (B,L,Hs,Dh); all f32."""
+        lambda (B,L,Hn,1,1), gate (B,L,Hs,Dh); all f32. With ``factors``, also the rank rows
+        b_k / b_v (B,L,R,Dh) and coefficients a_k / a_v (B,L,Hk,R)."""
         B, L, _ = h.shape
         Hq, Hk, Dh, Rk = self.n_heads, self.n_kv, self.head_dim, self.rank
         big = self.in_proj(h).astype(mx.float32)
@@ -396,7 +539,7 @@ class DiffTPAttention(nn.Module):
         q = q.reshape(B, L, Hq, Dh)
         k = (a_k.reshape(B, L, Hk, Rk) @ b_k.reshape(B, L, Rk, Dh)) / Rk
         v = (a_v.reshape(B, L, Hk, Rk) @ b_v.reshape(B, L, Rk, Dh)) / Rk
-        return (
+        out = (
             q,
             k,
             v,
@@ -405,12 +548,31 @@ class DiffTPAttention(nn.Module):
             mx.sigmoid(lam)[..., None, None],
             gate.reshape(B, L, self.n_sig, Dh),
         )
+        if factors:
+            out += (
+                b_k.reshape(B, L, Rk, Dh),
+                b_v.reshape(B, L, Rk, Dh),
+                a_k.reshape(B, L, Hk, Rk),
+                a_v.reshape(B, L, Hk, Rk),
+            )
+        return out
 
     def __call__(self, h, kv_cache, shift_cache, mask, positions):
         """h: (B, L, D). positions: (B, L) absolute positions (0 = first token)."""
         B, L, _ = h.shape
-        Hk, Dh = self.n_kv, self.head_dim
-        q, k, v, alpha_k, alpha_v, lam, gate = self.project(h)
+        Hk, Dh, Rk = self.n_kv, self.head_dim, self.rank
+        factored = isinstance(kv_cache, FactoredKVCache)
+        if factored:
+            q, k, v, alpha_k, alpha_v, lam, gate, b_k, b_v, a_k, a_v = self.project(h, factors=True)
+            # coefficients of the previous token (token shift) from the shift cache
+            if shift_cache[2] is not None:
+                ak_last, av_last = shift_cache[2], shift_cache[3]
+            else:
+                ak_last = av_last = mx.zeros((B, 1, Hk, Rk), dtype=mx.float32)
+            ak_prev = mx.concatenate([ak_last, a_k[:, :-1]], axis=1)
+            av_prev = mx.concatenate([av_last, a_v[:, :-1]], axis=1)
+        else:
+            q, k, v, alpha_k, alpha_v, lam, gate = self.project(h)
 
         # token shift: mix with the previous token's raw k / v
         if shift_cache is not None and shift_cache[0] is not None:
@@ -434,9 +596,15 @@ class DiffTPAttention(nn.Module):
                 shift_cache[1] = mx.where(
                     keep, mx.take_along_axis(v, idx, axis=1), v_last
                 )
+                if factored:
+                    shift_cache[2] = mx.where(keep, mx.take_along_axis(a_k, idx, axis=1), ak_last)
+                    shift_cache[3] = mx.where(keep, mx.take_along_axis(a_v, idx, axis=1), av_last)
             else:
                 shift_cache[0] = k[:, -1:]
                 shift_cache[1] = v[:, -1:]
+                if factored:
+                    shift_cache[2] = a_k[:, -1:]
+                    shift_cache[3] = a_v[:, -1:]
             if hasattr(shift_cache, "advance"):
                 shift_cache.advance(L)
         first = (positions <= 0)[..., None, None]  # document start: no shift
@@ -444,6 +612,15 @@ class DiffTPAttention(nn.Module):
         alpha_v = mx.where(first, 0.0, alpha_v)
         k = alpha_k * k_prev + (1 - alpha_k) * k
         v = alpha_v * v_prev + (1 - alpha_v) * v
+        if factored:
+            # the k-norm scale of each (token, kv head) goes into the coefficients, its weight into the rows
+            rn = mx.rsqrt(mx.mean(k * k, axis=-1, keepdims=True) + self.eps)  # (B,L,Hk,1)
+            kn = _zc(self.k_norm.norm.weight, self.zc).astype(mx.float32)
+            ck = mx.concatenate([rn * (1 - alpha_k) * a_k, rn * alpha_k * ak_prev], axis=-1) / Rk
+            cv = mx.concatenate([(1 - alpha_v) * a_v, alpha_v * av_prev], axis=-1) / Rk
+            kv_cache.append(
+                (b_k * kn).astype(h.dtype), b_v.astype(h.dtype), ck, cv
+            )
 
         q = mx.fast.rms_norm(
             q, _zc(self.q_norm.norm.weight, self.zc).astype(mx.float32), self.eps
@@ -461,7 +638,9 @@ class DiffTPAttention(nn.Module):
         q = q.astype(dtype).transpose(0, 2, 1, 3)
         k = k.astype(dtype).transpose(0, 2, 1, 3)
         v = v.astype(dtype).transpose(0, 2, 1, 3)
-        if kv_cache is not None:
+        if factored:
+            k, v = kv_cache.expand(dtype)
+        elif kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
         from . import metal
 
@@ -654,6 +833,16 @@ def _attention_mask(kv_cache, L: int, window: int):
     return "causal"
 
 
+def make_cache(layers) -> list[Any]:
+    """M layers: ArraysCache(1). V layers: CacheList(KV cache, shift cache); the factored layout keeps the
+    previous token's coefficients a_k / a_v next to its raw k / v (ArraysCache(4))."""
+    if _TPA_CACHE == "factored":
+        attn = lambda: CacheList(FactoredKVCache(), ArraysCache(4))  # noqa: E731
+    else:
+        attn = lambda: CacheList(KVCache(), ArraysCache(2))  # noqa: E731
+    return [ArraysCache(1) if layer.layer_type == "M" else attn() for layer in layers]
+
+
 def quant_predicate(path: str, module) -> bool:
     """Keep the router and the small per-head projections in full precision."""
     return not path.endswith(("moe_gate", "in_proj_small"))
@@ -688,12 +877,7 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self) -> list[Any]:
-        return [
-            ArraysCache(1)
-            if layer.layer_type == "M"
-            else CacheList(KVCache(), ArraysCache(2))
-            for layer in self.model.layers
-        ]
+        return make_cache(self.model.layers)
 
     def sanitize(self, weights: dict) -> dict:
         """Map a HF checkpoint (or an already converted MLX one) to this module tree."""
