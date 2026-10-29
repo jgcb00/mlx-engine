@@ -94,7 +94,21 @@ Things measured along the way that shape the code:
   decoding: exact, but the attention kernel was 1.3-2.9x slower. It needs ~4.6x
   the multiply-adds of the full cache (all 48 heads against 4 rows per key, token
   shift included), which at the M3 Ultra's ~7 TFMA/s (simdgroup matrices) and
-  819 GB/s is at best on par with reading the full cache.
+  819 GB/s is at best on par with reading the full cache. On M5 the matrix units
+  (Metal tensor API, `tpa_decode`) make it on par up to 8k tokens and faster beyond
+  (+12-19 % at 32k, +14-22 % at 64k). One sequence, M5 Max 128 GB, tokens/s at
+  0 / 8k / 32k / 48k / 64k context:
+
+  | | full | factored |
+  |---|---|---|
+  | q8 | 269 / 216 / 142 / 134 / 129 | 264 / 214 / 169 / 156 / 157 |
+  | q6 | 311 / 242 / 147 / 140 / 134 | 306 / 241 / 167 / 154 / 152 |
+  | bf16 | 175 / 151 / 109 / 105 / 102 | 173 / 150 / 122 / 115 / 117 |
+
+  Each threadgroup takes a block of keys sized so that the grid
+  fills whole waves of 2 threadgroups per GPU core; more, smaller blocks lost to
+  the cost of combining the partial results. The factored cache stays opt-in
+  (`OLALA_TPA_CACHE=factored`) because batched serving (`BatchKVCache`) does not use it.
 - A decode step is the sum of the latencies of its ~230 dependent kernels (~3.5 us dispatch
   floor each on M3 Ultra, plus the first-load latency); kernels that depend on nothing
   (e.g. zeroing a buffer) overlap and cost nothing. Removing 72 of them by moving the work
@@ -110,7 +124,9 @@ Things measured along the way that shape the code:
 
 Switches: `OLALA_FUSED=0` / `OLALA_FUSED_PREFILL=0` use the reference path for
 decode / prefill, `OLALA_M3_CHUNKED=0` the sequential Mamba-3 prefill kernel,
-`OLALA_FA_MMA=0` the scalar prefill attention kernel, `OLALA_MLX_REF=1` disables all Metal
+`OLALA_FA_MMA=0` the scalar prefill attention kernel, `OLALA_TPA_CACHE=factored` the
+factored KV cache (fused decode on M5 and later only, reference path elsewhere),
+`OLALA_MLX_REF=1` disables all Metal
 kernels, `OLALA_WARMUP=0` disables the kernel warm-up.
 
 MLX commits a command buffer every few dozen operations by default; with
