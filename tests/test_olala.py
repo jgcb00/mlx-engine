@@ -471,3 +471,34 @@ def test_batch_generator_matches_single_sequences(monkeypatch, layout, fused):
         assert kinds == {"FactoredKVCache"}
     assert (steps["fused"] > 0) == (fused == "1")
     assert [got.get(u) for u in uids] == ref
+
+
+@pytest.mark.parametrize("layout", ["full", "factored"])
+def test_vlm_cache_layout_and_prompt_cache_round_trip(monkeypatch, layout):
+    """mlx-vlm wrapper (mlx-engine's BatchedVisionModelKit): make_cache follows the layout, and a cache saved the
+    way the prompt cache does it (class name, state, meta_state, extract(0) snapshot) restores through mlx-vlm's
+    cache module and decodes like the original."""
+    from mlx_vlm.models import cache as vlm_cache
+
+    monkeypatch.setenv("OLALA_FUSED", "0")
+    monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+    vlm = importlib.import_module("mlx_vlm.models.olala")
+    m = _tiny_model()
+    lm = vlm.LanguageModel(vlm.ModelConfig.from_dict(TINY))
+    lm.update(m.parameters())
+    cache = lm.make_cache()
+    kv = {type(c[0]).__name__ for c in cache if hasattr(c, "caches")}
+    assert kv == {"FactoredKVCache" if layout == "factored" else "KVCache"}
+    prompt = mx.random.randint(0, TINY["vocab_size"], (1, 33))
+    mx.eval(lm(prompt, cache=cache).logits)
+
+    snap = [c.extract(0) if hasattr(c, "extract") else c for c in cache]
+    names = [type(c).__name__ for c in snap]
+    state, meta = [c.state for c in snap], [c.meta_state for c in snap]
+    mx.eval(state)
+    restored = [getattr(vlm_cache, n).from_state(s, mm) for n, s, mm in zip(names, state, meta)]
+
+    tok = prompt[:, -1:]
+    a = lm(tok, cache=cache).logits
+    b = lm(tok, cache=restored).logits
+    assert mx.allclose(a, b, atol=1e-5).item(), mx.abs(a - b).max().item()

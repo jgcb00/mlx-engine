@@ -246,11 +246,17 @@ class FactoredKVCache(_MlxKVCache):
 
     @property
     def state(self):
+        if self.rows_k is None:
+            return []
         o = self.offset
         return self.rows_k[:, :o], self.rows_v[:, :o], self.coef_k[:, :o], self.coef_v[:, :o]
 
     @state.setter
     def state(self, v):
+        if not v:
+            self.rows_k = self.rows_v = self.coef_k = self.coef_v = None
+            self.offset = self._hw = 0
+            return
         self.rows_k, self.rows_v, self.coef_k, self.coef_v = v
         self.offset = self.rows_k.shape[1]
         self._hw = self.offset  # restored buffers may be shared: no in-place append until regrown
@@ -302,6 +308,33 @@ class FactoredKVCache(_MlxKVCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    # serialization as mlx-vlm's prompt cache does it (class name, state, meta_state)
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        pass
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        c = cls()
+        c.state = state
+        return c
+
+    def extract(self, idx):
+        """Row ``idx`` as a new cache with its own buffers (mlx-vlm's KVCache.extract: prompt-cache snapshots)."""
+        cache = FactoredKVCache()
+        if self.rows_k is None:
+            return cache
+        o = self.offset
+        cache.rows_k, cache.rows_v, cache.coef_k, cache.coef_v = (
+            mx.contiguous(a[idx : idx + 1, :o]) for a in (self.rows_k, self.rows_v, self.coef_k, self.coef_v)
+        )
+        cache.offset = cache._hw = o
+        return cache
 
     @property
     def write_index(self):
@@ -1092,10 +1125,15 @@ def _factored_fused(layers) -> bool:
     )
 
 
+def tpa_cache_factored(layers) -> bool:
+    """Layout of the attention caches: OLALA_TPA_CACHE=full|factored, or auto (factored where its decode is fused)."""
+    return _TPA_CACHE == "factored" or (_TPA_CACHE == "auto" and _factored_fused(layers))
+
+
 def make_cache(layers) -> list[Any]:
     """M layers: ArraysCache(1). V layers: CacheList(KV cache, shift cache); the factored layout keeps the
     previous token's coefficients a_k / a_v next to its raw k / v (ArraysCache(4))."""
-    if _TPA_CACHE == "factored" or (_TPA_CACHE == "auto" and _factored_fused(layers)):
+    if tpa_cache_factored(layers):
         attn = lambda: CacheList(FactoredKVCache(), ArraysCache(4))  # noqa: E731
     else:
         attn = lambda: CacheList(KVCache(), ArraysCache(2))  # noqa: E731

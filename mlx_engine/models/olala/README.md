@@ -110,8 +110,11 @@ Things measured along the way that shape the code:
   the cost of combining the partial results. The layout is chosen per GPU
   (`OLALA_TPA_CACHE=auto`, the default): factored where the fused factored decode runs
   (matrix units, Olala's 48 heads), full elsewhere. mlx-lm's continuous batching
-  (`BatchGenerator`, `mlx_lm.server`) takes it through `BatchFactoredKVCache`; the
-  mlx-vlm wrapper (`vlm.py`, mlx-engine's `BatchedVisionModelKit`) still builds full caches.
+  (`BatchGenerator`, `mlx_lm.server`) and mlx-engine's serving (`BatchedVisionModelKit`
+  through the mlx-vlm wrapper `vlm.py`) take it through `BatchFactoredKVCache`. The
+  prompt cache saves and restores it like the other layer caches (class name, `state`,
+  `meta_state`; `vlm.py` registers the factored classes in mlx-vlm's cache module), and
+  the context auto-fit counts its bytes per token.
   Measured along the way: the factored path varies more from run to run than the full
   one (KL between two identical runs ~2e-4 against ~2e-6, once 0.15 in 8 runs) although
   `tpa_decode` itself is deterministic: it amplifies the float noise of the layers
@@ -155,4 +158,5 @@ rows, MMA against scalar prefill attention, short against long-context decode at
 fused MoE against the reference experts, cache layout, in-place KV semantics, weight
 merging, factored against full cache, `tpa_decode` against `attn_decode`,
 `BatchFactoredKVCache` against mlx-lm's `BatchKVCache` (merge / filter / extend /
-extract), continuous batching (`BatchGenerator`) against one sequence at a time.
+extract), continuous batching (`BatchGenerator`) against one sequence at a time,
+mlx-vlm cache layout and prompt-cache round trip (save / restore, then decode).

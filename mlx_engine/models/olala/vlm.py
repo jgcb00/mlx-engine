@@ -28,6 +28,12 @@ class CacheList(olala.AttnCacheMixin, vlm_cache.CacheList):
     pass
 
 
+# mlx-vlm restores cached prompts by class name from its cache module (CacheList.from_state looks members up in
+# its globals): make the factored caches findable there.
+vlm_cache.FactoredKVCache = olala.FactoredKVCache
+vlm_cache.BatchFactoredKVCache = olala.BatchFactoredKVCache
+
+
 class LanguageModel(olala.Model):
     def __call__(
         self, inputs=None, cache=None, inputs_embeds=None, logits_to_keep=None, **kwargs
@@ -49,10 +55,12 @@ class LanguageModel(olala.Model):
         )
 
     def make_cache(self):
+        if olala.tpa_cache_factored(self.model.layers):
+            attn = lambda: CacheList(olala.FactoredKVCache(), vlm_cache.ArraysCache(4))  # noqa: E731
+        else:
+            attn = lambda: CacheList(KVCache(), vlm_cache.ArraysCache(2))  # noqa: E731
         return [
-            vlm_cache.ArraysCache(1)
-            if layer.layer_type == "M"
-            else CacheList(KVCache(), vlm_cache.ArraysCache(2))
+            vlm_cache.ArraysCache(1) if layer.layer_type == "M" else attn()
             for layer in self.model.layers
         ]
 

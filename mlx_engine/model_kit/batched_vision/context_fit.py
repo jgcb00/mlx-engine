@@ -48,7 +48,7 @@ PREFILL_STEP_CANDIDATES = (2_048, 1_024, 512)
 _FAMILY_GEMMA4 = "gemma4"
 _FAMILY_GPT_OSS = "gpt_oss"
 _FAMILY_QWEN3_5 = "qwen3_5"
-_SUPPORTED_CACHE_TYPES = {"KVCache", "RotatingKVCache", "ArraysCache"}
+_SUPPORTED_CACHE_TYPES = {"KVCache", "RotatingKVCache", "ArraysCache", "FactoredKVCache"}
 
 
 def _config_value(config: Any, key: str) -> Any:
@@ -561,6 +561,10 @@ def _probe_cache_fit_profile(
 
         if cache_type == "KVCache":
             full_kv_bytes_per_token += cache.nbytes // cache.keys.shape[2]
+            cache_allocation_steps.add(cache.step)
+        elif cache_type == "FactoredKVCache":
+            # Olala's factored (TPA) cache: per-token factors, cells on axis 1
+            full_kv_bytes_per_token += cache.nbytes // cache.cap
             cache_allocation_steps.add(cache.step)
         elif cache_type == "RotatingKVCache":
             if cache.keep != 0:
