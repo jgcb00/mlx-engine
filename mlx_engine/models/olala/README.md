@@ -119,15 +119,15 @@ Things measured along the way that shape the code:
 
   | | full | factored |
   |---|---|---|
-  | mlx-engine 8 × 4096 | 324 (9.9) | 420 (9.6) |
+  | mlx-engine 8 × 4096 | 328 (9.9) | 354 (9.6) |
   | mlx-engine 32 × 4096 | 655 (16.2) | 654 (12.5) |
   | mlx-engine 64 × 2048 | 1075 (18.5) | 1136 (13.7) |
-  | mlx-engine 8 × 16384 | 292 (14.0) | 284 (11.6) |
+  | mlx-engine 8 × 16384 | 286 (13.9) | 284 (11.6) |
   | mlx-lm `BatchGenerator` 32 × 4096 | 858 (18.1) | 886 (19.5) |
   | mlx-lm `BatchGenerator` 128 × 2048 | 1386 (29.0) | 1435 (26.6) |
 
-  At these contexts the attention is a small part of a step: factored is −3 to +6 %
-  (+30 % once at 8 × 4096) and its gain grows with the context (one sequence above).
+  At these contexts the attention is a small part of a step: factored is −1 to +8 %
+  and its gain grows with the context (one sequence above).
   Measured along the way: the factored path varies more from run to run than the full
   one (KL between two identical runs ~2e-4 against ~2e-6, once 0.15 in 8 runs) although
   `tpa_decode` itself is deterministic: it amplifies the float noise of the layers
