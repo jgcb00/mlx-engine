@@ -358,3 +358,116 @@ def test_tpa_decode_matches_attn_decode():
         pytest.skip(str(e).splitlines()[0])
     err = (mx.abs(got - ref).max() / mx.abs(ref).max()).item()
     assert err < 2e-3, err
+
+
+def _factored_cache(n, seed, R=4, Dh=128, Hk=2):
+    mx.random.seed(seed)
+    c = olala_model.FactoredKVCache()
+    if n:
+        c.append(
+            mx.random.normal((1, n, R, Dh)).astype(mx.bfloat16),
+            mx.random.normal((1, n, R, Dh)).astype(mx.bfloat16),
+            mx.random.normal((1, n, Hk, 2 * R)),
+            mx.random.normal((1, n, Hk, 2 * R)),
+        )
+    return c
+
+
+def _expanded(c):
+    """mlx-lm KVCache holding the expanded K / V of a FactoredKVCache (the reference layout)."""
+    from mlx_lm.models.cache import KVCache as MlxKVCache
+
+    ref = MlxKVCache()
+    if c.offset:
+        ref.update_and_fetch(*c.expand(mx.float32))
+    return ref
+
+
+def test_batch_factored_cache_follows_batch_kv_cache():
+    """BatchFactoredKVCache bookkeeping (merge, filter, extend, extract) against mlx-lm's BatchKVCache on the
+    expanded K / V of the same sequences."""
+    from mlx_lm.models.cache import BatchKVCache
+
+    def same(fac, ref):
+        mx.eval(fac.left_padding, ref.left_padding)
+        assert fac.left_padding.tolist() == ref.left_padding.tolist()
+        assert fac.offset.tolist() == ref.offset.tolist() and fac.size() == ref.size()
+        assert fac.cap >= fac.size() + fac.PAD
+        k, v = fac.expand(mx.float32)
+        rk, rv = ref.keys_and_values()
+        lp = ref.left_padding.tolist()
+        for b, p in enumerate(lp):  # padding cells hold nothing meaningful
+            assert mx.allclose(k[b, :, p:], rk[b, :, p:], atol=1e-4).item()
+            assert mx.allclose(v[b, :, p:], rv[b, :, p:], atol=1e-4).item()
+
+    seqs = [_factored_cache(n, s) for s, n in enumerate([5, 0, 40, 17])]
+    fac = olala_model.BatchFactoredKVCache.merge(seqs)
+    ref = BatchKVCache.merge([_expanded(c) for c in seqs])
+    assert ref.left_padding.tolist() == [35, 40, 0, 23]
+    same(fac, ref)
+    fac.filter([0, 3])
+    ref.filter([0, 3])
+    same(fac, ref)
+    more = [_factored_cache(n, 10 + s) for s, n in enumerate([60, 2])]
+    fac.extend(olala_model.BatchFactoredKVCache.merge(more))
+    ref.extend(BatchKVCache.merge([_expanded(c) for c in more]))
+    same(fac, ref)
+    for i, n in enumerate([5, 17, 60, 2]):
+        one = fac.extract(i)
+        assert isinstance(one, olala_model.FactoredKVCache) and one.offset == n
+        k, _ = one.expand(mx.float32)
+        rk, _ = ref.extract(i).keys_and_values()
+        assert mx.allclose(k, rk, atol=1e-4).item()
+
+
+@pytest.mark.parametrize("layout,fused", [("full", "0"), ("factored", "0"), ("full", "1")])
+def test_batch_generator_matches_single_sequences(monkeypatch, layout, fused):
+    """Continuous batching (mlx-lm BatchGenerator: prompts of different lengths, sequences joining while others
+    generate) gives the same greedy tokens as decoding each sequence alone. The fused factored decode needs
+    Olala's 48 heads (not the tiny model); it is checked against tpa_decode's reference in the test above."""
+    from mlx_lm.generate import BatchGenerator
+
+    monkeypatch.setenv("OLALA_FUSED", fused)
+    monkeypatch.setattr(olala_model, "_ACT_F32", True)
+    monkeypatch.setattr(olala_model, "_TPA_CACHE", layout)
+    m = _tiny_model()
+    mx.random.seed(1)
+    prompts = [mx.random.randint(0, TINY["vocab_size"], (n,)).tolist() for n in [37, 5, 70, 12, 3, 50]]
+    N = 10
+
+    def single(p):
+        cache = m.make_cache()
+        logits = m(mx.array([p]), cache=cache)[:, -1]
+        out = []
+        for _ in range(N):
+            t = mx.argmax(logits, axis=-1)
+            out.append(t.item())
+            logits = m(t.reshape(1, 1), cache=cache)[:, -1]
+        return out
+
+    ref = [single(p) for p in prompts]
+    decode = metal.can_decode
+    steps = {"fused": 0}
+
+    def spy(*a, **k):
+        ok = decode(*a, **k)
+        steps["fused"] += ok
+        return ok
+
+    monkeypatch.setattr(metal, "can_decode", spy)
+    gen = BatchGenerator(m, max_tokens=N, prefill_batch_size=2, completion_batch_size=4)
+    uids = list(gen.insert(prompts[:3]))
+    got = {}
+    for step in range(200):
+        if step == 3:
+            uids += gen.insert(prompts[3:])
+        for r in gen.next_generated():
+            got.setdefault(r.uid, []).append(r.token)
+        if len(got) == len(prompts) and all(len(v) == N for v in got.values()):
+            break
+    gen.close()
+    if layout == "factored":
+        kinds = {type(c[0]).__name__ for c in m.make_cache() if hasattr(c, "caches")}
+        assert kinds == {"FactoredKVCache"}
+    assert (steps["fused"] > 0) == (fused == "1")
+    assert [got.get(u) for u in uids] == ref

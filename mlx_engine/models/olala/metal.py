@@ -3053,9 +3053,9 @@ def can_decode(model, x, cache, ssm_mask) -> bool:
         if c is None or not hasattr(c, "caches"):
             return False
         c = c.caches[0]
-        if type(c).__name__ not in ("KVCache", "BatchKVCache", "FactoredKVCache") or c.keys is None:
+        if type(c).__name__ not in ("KVCache", "BatchKVCache", "FactoredKVCache", "BatchFactoredKVCache") or c.keys is None:
             return False
-        if type(c).__name__ == "FactoredKVCache" and (model.layers[i].mixer.n_heads * 8 != TPA_NSG * 32 or not has_tensor()):
+        if "Factored" in type(c).__name__ and (model.layers[i].mixer.n_heads * 8 != TPA_NSG * 32 or not has_tensor()):
             return False  # tpa_decode: 8 softmax lanes per head in 12 simdgroups (Olala: 48 heads), matrix units
     for i in model.ssm_idx:
         c = cache[i]
@@ -3221,7 +3221,7 @@ def _v_layer(L, resid, g, prev_geo, prev_li, cache, pos, T, D, shared, gst=None)
     att = L["attn"]
     Hq, Hk, Dh, Rk = att.n_heads, att.n_kv, att.head_dim, att.rank
     kc, sc = cache.caches[0], cache.caches[1]
-    if type(kc).__name__ == "FactoredKVCache":
+    if "Factored" in type(kc).__name__:
         return _v_layer_factored(L, att, kc, sc, big, small, resid, pos, T, D, shared)
     kv_dtype = kc.keys.dtype
     if sc[0] is None:
@@ -3305,7 +3305,8 @@ _warmup_started = set()
 
 
 def _v_layer_factored(L, att, kc, sc, big, small, resid, pos, T, D, shared):
-    """_v_layer over model.FactoredKVCache: factors written in place, tensor-API attention (tpa_decode)."""
+    """_v_layer over model.FactoredKVCache / BatchFactoredKVCache: factors written in place, tensor-API attention
+    (tpa_decode). Batched rows are left-padded: their keys start at left_padding."""
     Hq, Hk, Dh, Rk = att.n_heads, att.n_kv, att.head_dim, att.rank
     if sc[0] is None:
         kprev = vprev = mx.zeros((T, 1, Hk, Dh), mx.float32)
@@ -3314,19 +3315,21 @@ def _v_layer_factored(L, att, kc, sc, big, small, resid, pos, T, D, shared):
         kprev, vprev = sc[0].astype(mx.float32), sc[1].astype(mx.float32)
         akprev, avprev = sc[2].astype(mx.float32), sc[3].astype(mx.float32)
     kc.ensure_inplace(1)
-    if shared.get("wpos_off") != kc.offset:
-        shared["wpos_off"] = kc.offset
-        shared["wpos"] = mx.full((T,), kc.offset, dtype=mx.int32)
+    w = kc.write_index
+    if shared.get("wpos_off") != w:
+        shared["wpos_off"] = w
+        shared["wpos"] = mx.full((T,), w, dtype=mx.int32)
     q, kraw, vraw, akraw, avraw = v_prep_factored(
         big, small, kprev, vprev, akprev, avprev, L["prm"], pos, Hq, Hk, Dh, Rk, att.n_noise, att.window, T,
         kc.rows_k, kc.rows_v, kc.coef_k, kc.coef_v, shared["wpos"],
     )
     kc.commit_inplace(1)
     sc[0], sc[1], sc[2], sc[3] = kraw, vraw, akraw, avraw
-    S_len = kc.offset
+    S_len = kc.write_index
     if "kstart" not in shared:
+        lp = getattr(kc, "left_padding", None)
         ks = max(S_len - 1 - att.window, 0)
-        shared["kstart"] = mx.full((T,), ks).astype(mx.int32)
+        shared["kstart"] = (mx.maximum(lp, ks) if lp is not None else mx.full((T,), ks)).astype(mx.int32)
         shared["slen"] = mx.array([S_len], dtype=mx.int32)
     o, m, l = tpa_decode(
         q, kc.rows_k, kc.rows_v, kc.coef_k, kc.coef_v, shared["kstart"], shared["slen"], S_len,

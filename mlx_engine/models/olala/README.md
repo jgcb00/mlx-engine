@@ -107,8 +107,20 @@ Things measured along the way that shape the code:
 
   Each threadgroup takes a block of keys sized so that the grid
   fills whole waves of 2 threadgroups per GPU core; more, smaller blocks lost to
-  the cost of combining the partial results. The factored cache stays opt-in
-  (`OLALA_TPA_CACHE=factored`) because batched serving (`BatchKVCache`) does not use it.
+  the cost of combining the partial results. The layout is chosen per GPU
+  (`OLALA_TPA_CACHE=auto`, the default): factored where the fused factored decode runs
+  (matrix units, Olala's 48 heads), full elsewhere. mlx-lm's continuous batching
+  (`BatchGenerator`, `mlx_lm.server`) takes it through `BatchFactoredKVCache`; the
+  mlx-vlm wrapper (`vlm.py`, mlx-engine's `BatchedVisionModelKit`) still builds full caches.
+  Measured along the way: the factored path varies more from run to run than the full
+  one (KL between two identical runs ~2e-4 against ~2e-6, once 0.15 in 8 runs) although
+  `tpa_decode` itself is deterministic: it amplifies the float noise of the layers
+  before it (Q goes to bf16 for the matrix units). Its average accuracy is unchanged
+  (KLD against bf16 above).
+- Under mlx-lm's `BatchGenerator` the state caches keep `left_padding` (0 when merged,
+  then decreasing), so their mask was never `None` and continuous batching always took
+  the reference path; with one new token per row that mask is all true and is now
+  dropped (fused decode: ~4.5x the tokens/s at 8 rows).
 - A decode step is the sum of the latencies of its ~230 dependent kernels (~3.5 us dispatch
   floor each on M3 Ultra, plus the first-load latency); kernels that depend on nothing
   (e.g. zeroing a buffer) overlap and cost nothing. Removing 72 of them by moving the work
@@ -124,8 +136,9 @@ Things measured along the way that shape the code:
 
 Switches: `OLALA_FUSED=0` / `OLALA_FUSED_PREFILL=0` use the reference path for
 decode / prefill, `OLALA_M3_CHUNKED=0` the sequential Mamba-3 prefill kernel,
-`OLALA_FA_MMA=0` the scalar prefill attention kernel, `OLALA_TPA_CACHE=factored` the
-factored KV cache (fused decode on M5 and later only, reference path elsewhere),
+`OLALA_FA_MMA=0` the scalar prefill attention kernel, `OLALA_TPA_CACHE=full|factored`
+forces the KV cache layout (factored decode is fused on M5 and later only, reference
+path elsewhere),
 `OLALA_MLX_REF=1` disables all Metal
 kernels, `OLALA_WARMUP=0` disables the kernel warm-up.
 
@@ -140,4 +153,6 @@ the reference path with f32 activations (bf16 and 8 / 6 / 5 / 4-bit), chunked
 prefill against token-by-token, chunked against sequential Mamba-3 kernel, split GEMV
 rows, MMA against scalar prefill attention, short against long-context decode attention,
 fused MoE against the reference experts, cache layout, in-place KV semantics, weight
-merging.
+merging, factored against full cache, `tpa_decode` against `attn_decode`,
+`BatchFactoredKVCache` against mlx-lm's `BatchKVCache` (merge / filter / extend /
+extract), continuous batching (`BatchGenerator`) against one sequence at a time.

@@ -33,7 +33,9 @@ import mlx.core as mx
 from mlx import nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache
+from mlx_lm.models.cache import BatchKVCache as _MlxBatchKVCache
 from mlx_lm.models.cache import CacheList as _MlxCacheList
+from mlx_lm.models.cache import dynamic_roll
 from mlx_lm.models.cache import KVCache as _MlxKVCache
 from mlx_lm.models.switch_layers import SwitchLinear
 
@@ -44,9 +46,9 @@ _ACT_F32 = os.environ.get("OLALA_ACT_F32", "0") == "1"
 _M3_CHUNKED = os.environ.get("OLALA_M3_CHUNKED", "1") == "1"
 # KV cache layout of the attention layers: "full" (expanded K / V) or "factored" (TPA factors: the rank rows
 # B_k * k_norm and B_v of each token plus per-kv-head coefficients, ~2.2x less memory). Factored decoding is fused
-# only on GPUs with matrix units (M5 / A19, metal.tpa_decode); elsewhere it expands the cache every step. Full
-# stays the default: the factored cache is not wired into batched serving (BatchKVCache).
-_TPA_CACHE = os.environ.get("OLALA_TPA_CACHE", "full")
+# only on GPUs with matrix units (M5 / A19, metal.tpa_decode); elsewhere it expands the cache every step, so
+# "auto" (default) picks factored there only.
+_TPA_CACHE = os.environ.get("OLALA_TPA_CACHE", "auto")
 
 
 @dataclass
@@ -300,6 +302,248 @@ class FactoredKVCache(_MlxKVCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    @property
+    def write_index(self):
+        """Cell the next token is written to (same for every row)."""
+        return self.offset
+
+    @property
+    def nbytes(self):
+        if self.rows_k is None:
+            return 0
+        return sum(a.nbytes for a in (self.rows_k, self.rows_v, self.coef_k, self.coef_v))
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchFactoredKVCache.merge(caches)
+
+
+class BatchFactoredKVCache(_MlxBatchKVCache):
+    """FactoredKVCache of several sequences for continuous batching (mlx-lm BatchGenerator), laid out like
+    mlx-lm's BatchKVCache: left-padded rows, ``offset`` (B,) = position of the next token of each sequence,
+    ``_idx`` = cell the next token is written to. Cells are on axis 1 of rows_k / rows_v (B, cap, R, Dh) and
+    coef_k / coef_v (B, cap, Hk, 2R); the capacity always keeps PAD cells past ``_idx``.
+
+    The fused decode writes the new factors in place, which needs row-contiguous buffers no one else holds:
+    every operation that reshapes the batch (merge, extend, filter, finalize) leaves fresh contiguous arrays,
+    and copies / restored states disable in-place appends until the next regrow (as in FactoredKVCache)."""
+
+    PAD = FactoredKVCache.PAD
+
+    def __init__(self, left_padding):
+        super().__init__(left_padding)
+        self.rows_k = self.rows_v = self.coef_k = self.coef_v = None
+        self._hw = 0
+
+    def _arrays(self):
+        return (self.rows_k, self.rows_v, self.coef_k, self.coef_v)
+
+    def _set(self, arrays):
+        self.rows_k, self.rows_v, self.coef_k, self.coef_v = arrays
+
+    @property
+    def cap(self):
+        return 0 if self.rows_k is None else self.rows_k.shape[1]
+
+    def _alloc(self, B, need, like):
+        n = ((need + self.PAD + self.step - 1) // self.step) * self.step
+        return [mx.zeros((B, n) + a.shape[2:], a.dtype) for a in like]
+
+    def _grow_copy(self, need):
+        new = self._alloc(self.rows_k.shape[0], need, self._arrays())
+        o = self._idx
+        for i, a in enumerate(self._arrays()):
+            new[i][:, :o] = a[:, :o]
+        self._set(new)
+        self._hw = o
+
+    def append(self, fk, fv, ck, cv):
+        """fk / fv (B, L, R, Dh), ck / cv (B, L, Hk, 2R): factors of L new tokens (prefill, reference path)."""
+        L, o = fk.shape[1], self._idx
+        if self.rows_k is None:
+            self._set(self._alloc(fk.shape[0], o + L, (fk, fv, ck, cv)))
+        elif o + L + self.PAD > self.cap:
+            self._grow_copy(o + L)
+        self.rows_k[:, o : o + L] = fk
+        self.rows_v[:, o : o + L] = fv
+        self.coef_k[:, o : o + L] = ck
+        self.coef_v[:, o : o + L] = cv
+        self.offset = self.offset + L
+        self._idx += L
+        self._hw = self._idx
+
+    def expand(self, dtype):
+        """K / V of the cached cells (B, Hk, _idx, Dh) in ``dtype`` (for the prefill attention)."""
+        S = self._idx
+
+        def ex(rows, coef):
+            r = rows[:, :S].astype(mx.float32)
+            rp = mx.concatenate([mx.zeros_like(r[:, :1]), r[:, :-1]], axis=1)
+            return (coef[:, :S] @ mx.concatenate([r, rp], axis=2)).transpose(0, 2, 1, 3).astype(dtype)
+
+        return ex(self.rows_k, self.coef_k), ex(self.rows_v, self.coef_v)
+
+    # BatchKVCache interface: ``keys`` is only used as "not empty" / dtype marker
+    @property
+    def keys(self):
+        return self.rows_k
+
+    @keys.setter
+    def keys(self, v):
+        pass
+
+    @property
+    def values(self):
+        return self.rows_v
+
+    @values.setter
+    def values(self, v):
+        pass
+
+    def update_and_fetch(self, keys, values):
+        raise NotImplementedError("BatchFactoredKVCache: use append() / expand()")
+
+    def keys_and_values(self):
+        raise NotImplementedError("BatchFactoredKVCache: use expand()")
+
+    @property
+    def write_index(self):
+        return self._idx
+
+    def can_append_inplace(self, n: int = 1) -> bool:
+        return self.rows_k is not None and self._idx >= self._hw and self._idx + n + self.PAD <= self.cap
+
+    def ensure_inplace(self, n: int = 1):
+        if self.rows_k is not None and not self.can_append_inplace(n):
+            self._grow_copy(self._idx + n)
+
+    def commit_inplace(self, n: int = 1):
+        self.offset = self.offset + n
+        self._idx += n
+        self._hw = self._idx
+
+    def __copy__(self):
+        return self._shared_copy()
+
+    def __deepcopy__(self, memo):
+        return self._shared_copy()
+
+    def _shared_copy(self):
+        c = self.__class__.__new__(self.__class__)
+        c.__dict__.update(self.__dict__)
+        if self.rows_k is not None:
+            self._hw = c._hw = self.cap
+        return c
+
+    def finalize(self):
+        if self._right_padding is not None:
+            p = self._right_padding
+            self._set([dynamic_roll(a, p, axis=1) for a in self._arrays()])
+            self.offset = self.offset - p
+            self.left_padding += p
+            self._right_padding = None
+            self._hw = self._idx
+
+    @property
+    def state(self):
+        return (*self._arrays(), self.offset, self.left_padding, self._idx)
+
+    @state.setter
+    def state(self, v):
+        *arrays, self.offset, self.left_padding, self._idx = v
+        self._set(arrays)
+        self._hw = self.cap  # restored buffers may be shared: no in-place append until regrown
+
+    def filter(self, batch_indices):
+        """In-place filter to keep just the given rows; drops the left padding they all share."""
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+        drop = min(self.left_padding.tolist())
+        if self.rows_k is not None:
+            idx = mx.array(batch_indices)
+            self._set([mx.contiguous(a[idx][:, drop:]) for a in self._arrays()])
+            self._hw = self._idx - drop
+        self._idx -= drop
+        self.left_padding -= drop
+
+    def extend(self, other):
+        """In-place extend this cache with the rows of ``other``, right-aligned on the write index."""
+        if self.rows_k is None and other.rows_k is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+        like = self._arrays() if self.rows_k is not None else other._arrays()
+        idx = max(self._idx, other._idx)
+        size = max(self.cap, other.cap, idx + self.PAD)
+
+        def pad(c):
+            arrays = c._arrays()
+            if arrays[0] is None:
+                arrays = [mx.zeros((c.offset.shape[0], 0) + a.shape[2:], a.dtype) for a in like]
+            left = idx - c._idx
+            out = []
+            for a in arrays:
+                right = size - a.shape[1] - left
+                if right < 0:
+                    a, right = a[:, :right], 0
+                if left or right:
+                    a = mx.pad(a, [(0, 0), (left, right)] + [(0, 0)] * (a.ndim - 2))
+                out.append(a)
+            return out, c.offset, c.left_padding + left
+
+        (a1, o1, l1), (a2, o2, l2) = pad(self), pad(other)
+        self._set([mx.concatenate([x, y]) for x, y in zip(a1, a2)])
+        self.offset = mx.concatenate([o1, o2])
+        self.left_padding = mx.concatenate([l1, l2])
+        self._idx = idx
+        self._hw = idx
+
+    def extract(self, idx):
+        cache = FactoredKVCache()
+        mx.eval(self.left_padding)
+        p = self.left_padding.tolist()[idx]
+        cache.rows_k, cache.rows_v, cache.coef_k, cache.coef_v = (
+            mx.contiguous(a[idx : idx + 1, p : self._idx]) for a in self._arrays()
+        )
+        cache.offset = self._idx - p
+        cache._hw = cache.offset
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        lengths = [c.offset for c in caches]
+        n = max(lengths)
+        if n == 0:
+            return cls([0] * len(caches))
+        padding = [n - l for l in lengths]
+        like = next(
+            (c.rows_k, c.rows_v, c.coef_k, c.coef_v) for c in caches if c.rows_k is not None
+        )
+        cache = cls(padding)
+        arrays = cache._alloc(len(caches), n, like)
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            if c.rows_k is None or c.offset == 0:
+                continue
+            for a, src in zip(arrays, (c.rows_k, c.rows_v, c.coef_k, c.coef_v)):
+                a[i : i + 1, p : p + c.offset] = src[:, : c.offset]
+        cache._set(arrays)
+        cache.offset += n
+        cache._idx = n
+        cache._hw = n
+        return cache
+
+    def size(self):
+        return self._idx
+
+    def empty(self):
+        return self.rows_k is None
+
+    @property
+    def nbytes(self):
+        if self.rows_k is None:
+            return 0
+        return sum(a.nbytes for a in self._arrays())
 
 
 class AttnCacheMixin:
@@ -561,7 +805,7 @@ class DiffTPAttention(nn.Module):
         """h: (B, L, D). positions: (B, L) absolute positions (0 = first token)."""
         B, L, _ = h.shape
         Hk, Dh, Rk = self.n_kv, self.head_dim, self.rank
-        factored = isinstance(kv_cache, FactoredKVCache)
+        factored = isinstance(kv_cache, (FactoredKVCache, BatchFactoredKVCache))
         if factored:
             q, k, v, alpha_k, alpha_v, lam, gate, b_k, b_v, a_k, a_v = self.project(h, factors=True)
             # coefficients of the previous token (token shift) from the shift cache
@@ -777,6 +1021,10 @@ class OlalaModel(nn.Module):
             if c_ssm is not None and hasattr(c_ssm, "make_mask")
             else None
         )
+        if L == 1 and getattr(c_ssm, "lengths", None) is None:
+            # continuous batching (mlx-lm BatchGenerator): the state caches' left_padding is 0 when merged and
+            # only decreases, so one new token per row is never padding; no mask keeps the fused decode
+            ssm_mask = None
 
         from . import metal
 
@@ -833,10 +1081,21 @@ def _attention_mask(kv_cache, L: int, window: int):
     return "causal"
 
 
+def _factored_fused(layers) -> bool:
+    """The fused factored decode (metal.tpa_decode) runs here: matrix units, Olala's 48 heads."""
+    from . import metal
+
+    if not metal.enabled() or not metal.has_tensor():
+        return False
+    return all(
+        layer.mixer.n_heads * 8 == metal.TPA_NSG * 32 for layer in layers if layer.layer_type != "M"
+    )
+
+
 def make_cache(layers) -> list[Any]:
     """M layers: ArraysCache(1). V layers: CacheList(KV cache, shift cache); the factored layout keeps the
     previous token's coefficients a_k / a_v next to its raw k / v (ArraysCache(4))."""
-    if _TPA_CACHE == "factored":
+    if _TPA_CACHE == "factored" or (_TPA_CACHE == "auto" and _factored_fused(layers)):
         attn = lambda: CacheList(FactoredKVCache(), ArraysCache(4))  # noqa: E731
     else:
         attn = lambda: CacheList(KVCache(), ArraysCache(2))  # noqa: E731
