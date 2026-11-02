@@ -114,7 +114,20 @@ Things measured along the way that shape the code:
   through the mlx-vlm wrapper `vlm.py`) take it through `BatchFactoredKVCache`. The
   prompt cache saves and restores it like the other layer caches (class name, `state`,
   `meta_state`; `vlm.py` registers the factored classes in mlx-vlm's cache module), and
-  the context auto-fit counts its bytes per token.
+  the context auto-fit counts its bytes per token. Serving, q8, M5 Max, total decode
+  tokens/s (peak GiB), B requests × P prompt tokens:
+
+  | | full | factored |
+  |---|---|---|
+  | mlx-engine 8 × 4096 | 324 (9.9) | 420 (9.6) |
+  | mlx-engine 32 × 4096 | 655 (16.2) | 654 (12.5) |
+  | mlx-engine 64 × 2048 | 1075 (18.5) | 1136 (13.7) |
+  | mlx-engine 8 × 16384 | 292 (14.0) | 284 (11.6) |
+  | mlx-lm `BatchGenerator` 32 × 4096 | 858 (18.1) | 886 (19.5) |
+  | mlx-lm `BatchGenerator` 128 × 2048 | 1386 (29.0) | 1435 (26.6) |
+
+  At these contexts the attention is a small part of a step: factored is −3 to +6 %
+  (+30 % once at 8 × 4096) and its gain grows with the context (one sequence above).
   Measured along the way: the factored path varies more from run to run than the full
   one (KL between two identical runs ~2e-4 against ~2e-6, once 0.15 in 8 runs) although
   `tpa_decode` itself is deterministic: it amplifies the float noise of the layers
@@ -123,7 +136,9 @@ Things measured along the way that shape the code:
 - Under mlx-lm's `BatchGenerator` the state caches keep `left_padding` (0 when merged,
   then decreasing), so their mask was never `None` and continuous batching always took
   the reference path; with one new token per row that mask is all true and is now
-  dropped (fused decode: ~4.5x the tokens/s at 8 rows).
+  dropped (full, q8: 287 → 551 tokens/s at 8 × 4096, 344 → 858 at 32 × 4096).
+  mlx-engine's serving merges each prefilled request as a batch of one, without padding,
+  and already decoded fused.
 - A decode step is the sum of the latencies of its ~230 dependent kernels (~3.5 us dispatch
   floor each on M3 Ultra, plus the first-load latency); kernels that depend on nothing
   (e.g. zeroing a buffer) overlap and cost nothing. Removing 72 of them by moving the work
